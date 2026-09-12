@@ -1,6 +1,6 @@
 [package]
 name        = "chacha20-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "RFC 8439's ChaCha20 and Poly1305: the twenty-round block function as a sixteen-word @value a device holds in its own frame, the one-time MAC fed a block at a time, the AEAD that seals into a caller's buffer and opens with a constant-time tag comparison, and XChaCha20-Poly1305 with the HChaCha20 subkey step for a 24-byte nonce.  The stream cipher for a core with no AES instructions.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

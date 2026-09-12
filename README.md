@@ -1,33 +1,56 @@
 # chacha20-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+ChaCha20 is a stream cipher and Poly1305 is a one-time message authenticator.
+Together they form the authenticated encryption scheme specified in
+[RFC 8439](https://www.rfc-editor.org/rfc/rfc8439). This package brings both to
+novo-lang, along with XChaCha20-Poly1305, the variant with a 192-bit nonce
+described in
+[draft-irtf-cfrg-xchacha](https://datatracker.ietf.org/doc/draft-irtf-cfrg-xchacha/).
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
+its full signature, but every body is a `todo()` that panics when called. The
+package is published so its design can be reviewed and depended on before it is
+implemented. Version 0.1.0 will be the first working release.
 
-## What this is
+## What ChaCha20-Poly1305 is
 
-RFC 8439 — the ChaCha20 stream cipher, the Poly1305 one-time
-authenticator, and the AEAD that combines them — plus
-XChaCha20-Poly1305 with its 192-bit nonce.  Every value the cipher
-carries is a `@value` struct of machine words, and everything that
-produces bytes writes them into a buffer the caller already owns.
+A *stream cipher* turns a key and a nonce into a long pseudorandom byte string,
+the *keystream*, and encrypts by XOR-ing the plaintext with it. Decryption is
+the same operation. ChaCha20 produces its keystream 64 bytes at a time by
+running twenty rounds of addition, XOR and rotation over sixteen 32-bit words.
 
-It is for the program that has no AES instructions to lean on: an nRF52
-peripheral, a hardware wallet, a RISC-V core in a sensor, and equally a
-server that would rather have one cipher whose timing does not depend
-on a table.  ChaCha20 is addition, XOR and rotation by constant
-amounts; there is no S-box to put in a cache and no data-dependent
-index anywhere in the round function.
+A *message authentication code* is a short value that proves a message was not
+altered. Poly1305 is a *one-time* authenticator: its key must never be reused,
+so RFC 8439 derives a fresh one from the cipher's own keystream for each
+message. The arithmetic is modulo the prime 2¹³⁰ − 5.
+
+*Authenticated encryption with associated data* (AEAD) combines the two in one
+operation. It encrypts the plaintext, authenticates the ciphertext together with
+some additional data that travels in the clear, and appends a 16-byte tag.
+Decryption checks the tag first and returns nothing if it does not match.
+
+| Value | ChaCha20-Poly1305 | XChaCha20-Poly1305 |
+| --- | --- | --- |
+| Key | 32 bytes | 32 bytes |
+| Nonce | 12 bytes | 24 bytes |
+| Tag | 16 bytes | 16 bytes |
+| Block | 64 bytes | 64 bytes |
+| Rounds | 20 | 20 |
+| Longest message under one key and nonce | 274877906880 bytes (2³⁸ − 64) | the same |
+
+ChaCha20 has no substitution table and no data-dependent array index anywhere in
+its round function, which is what makes it the cipher to reach for on a
+processor with no AES instructions: an nRF52 peripheral, a hardware wallet, a
+RISC-V core in a sensor, and equally a server that would rather have one cipher
+whose timing does not depend on a cache.
+
+## Install
 
 ```
 novo pkg add chacha20-nv
-novo pkg build
-novo test
 ```
 
-## The one example that will work
+## Example
 
 ```novo
 use std.bytes
@@ -39,191 +62,205 @@ fn protect(key: Bytes, nonce: Bytes, aad: Bytes, plaintext: Bytes) -> Result<Byt
     Ok(bytes.slice(out.finish(), 0, n))
 ```
 
-`seal_len` prices the call, the caller owns the buffer, and the tag is
-the last sixteen bytes of what comes back.  Nothing in this package
-allocates a result.
+`seal_len` gives the exact size the output needs, the caller owns the buffer,
+and the tag is the last sixteen bytes of what comes back. Nothing in this
+package allocates a result.
 
-## The load-bearing interface: a fallible call answers a COUNT, and the state moves by a pure function
+Build and test with:
 
-`Cc20State` is a `@value` struct — sixteen words in the caller's frame,
-no cell, no header, no reference count — and SPEC § 14.5 keeps an
-unboxed struct out of a `Result` payload.  So `apply_into` cannot hand
-back the advanced state, and there is no version of this package in
-which it could.
+```
+novo pkg build
+novo test
+```
 
-What replaces it is better than what it could not have:
+Today `novo test` fails on purpose: every test reaches a
+`not implemented: chacha20-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
+
+## What the package contains
+
+| Module | Contents | Builds for a microcontroller |
+| --- | --- | --- |
+| `chacha20` | The cipher at the lowest level: the sixteen-word state, the quarter round, the double round, the block function and HChaCha20. | yes |
+| `poly1305` | The authenticator at the lowest level, and the AEAD framing steps of RFC 8439 section 2.8. | yes |
+| `cc20bytes` | The boundary between `Bytes` and words: the width checks, the constructors, and the functions that write a block or a chunk into a cursor. | no |
+| `cc20aead` | ChaCha20-Poly1305 over buffers: `seal`, `open`, the keystream functions, and the sizing helpers `seal_len` and `open_len`. | no |
+| `cc20x` | XChaCha20-Poly1305 over buffers: `xseal`, `xopen`, the subkey step and the 24-byte nonce check. | no |
+| `cc20err` | The error type `Cc20Error`, its message, and the two questions `describe` and `is_authentication_failure`. | — |
+
+Six public types, 58 public functions, 15 public constants and one trait
+implementation.
+
+## How to choose an entry point
+
+**Most programs call `cc20x.xseal` and `cc20x.xopen`**, the 24-byte-nonce form.
+See "The rules a user needs" for why the nonce width matters.
+
+**Call `cc20aead.seal` and `cc20aead.open`** when a protocol specifies the
+12-byte nonce of RFC 8439, and you have a counter that cannot repeat.
+
+**Call `cc20aead.apply_into` and `cc20aead.advance`** to encrypt or decrypt in
+pieces. `apply_into` answers how many bytes it wrote; `advance` moves the
+keystream position by that many bytes and hands back the new state.
 
 ```novo
 let n  = cc20aead.apply_into(st, chunk, dst)!   // bytes written
 let st = cc20aead.advance(st, n)                // where the keystream is now
 ```
 
-The two facts a streaming cipher has to keep straight — how much went
-out, and where the keystream is — are two values on two lines rather
-than one tuple that has to be destructured correctly.  And because
-`advance` is separate, a caller may move the state **without producing
-output**, which is exactly what seeking into the middle of an encrypted
-file needs and what a fused call could not express:
-`with_counter(st, k)` is block `k` of the keystream and nothing before
-it has to be computed.
+The two facts a streaming cipher has to keep straight — how much went out, and
+where the keystream is — are two values on two lines. Because `advance` is a
+separate function, a caller can also move the state *without producing output*,
+which is what seeking into the middle of an encrypted file needs.
+`with_counter(st, k)` starts at block `k` of the keystream with nothing before
+it computed.
 
-The same constraint shapes the constructors.  `cc20bytes.state_from`
-cannot refuse a 16-byte key, so it does not pretend to: the width check
-is its own function — `check_key`, `check_nonce`, `cc20x.check_xnonce`,
-each answering `?Cc20Error` — called once, before anything is built.
-Every function a program actually calls (`seal`, `open`, `xseal`,
-`xopen`) checks for itself, so the only way to reach an unchecked
-constructor is to call it deliberately.
+**Firmware calls `chacha20` and `poly1305` directly.** See "Running on a
+microcontroller".
 
-## The two halves, and which one a device gets
+## The rules a user needs
 
-| module | what it is | a device can use it |
-| --- | --- | --- |
-| `chacha20` | the state, the rounds, the block function, HChaCha20 | **yes** |
-| `poly1305` | the authenticator, the AEAD framing steps | **yes** |
-| `cc20bytes` | `Bytes` in, words out, and back | no |
-| `cc20aead` | the stream cipher and the AEAD over buffers | no |
-| `cc20x` | XChaCha20 over buffers | no |
-| `cc20err` | `Cc20Error` | — |
+1. **A nonce must never repeat under one key.** A repeat destroys
+   ChaCha20-Poly1305 completely rather than weakening it. Two ciphertexts under
+   the same nonce XOR to the XOR of their plaintexts, and because the Poly1305
+   key is derived from the key *and* the nonce, two tags under a repeated nonce
+   leak the authentication key itself. After that anything can be forged.
+2. **Do not pick a 12-byte nonce at random.** 96 bits is too few: the chance of
+   a collision becomes real at about 2⁴⁸ messages, which a busy service reaches.
+   Either keep a counter that survives restarts, replicas and restored backups,
+   or use the 24-byte nonce, where the same bound is 2⁹⁶ and nothing reaches it.
+   That is the whole reason XChaCha20 exists.
+3. **This package cannot choose a nonce for you.** It draws no randomness and
+   keeps no counter. The key, the nonce and the block counter all arrive as
+   arguments.
+4. **At most 274877906880 bytes — 2³⁸ − 64, which is 256 GiB less one block —
+   may be encrypted under one key and nonce.** Past that the block counter wraps
+   and the keystream repeats. `apply_into` refuses with
+   `Cc20MessageTooLong(got, limit)` before it writes anything, which is why
+   `advance` cannot fail. A caller with more data than that needs a second
+   nonce, which is what age-nv's chunking does.
+5. **A failed `open` says nothing but `Cc20TagMismatch`, and writes nothing to
+   the caller's buffer.** No partial plaintext is produced and no detail about
+   where the mismatch was is reported.
+6. **Size the output buffer with `seal_len` or `open_len` first.** A buffer with
+   fewer bytes left than the call needs is `Cc20OutputTooSmall(want, have)`.
+   `open` on fewer than 16 bytes is `Cc20CiphertextTooShort(got, want)`, since
+   there is not even a tag there.
+7. **The width checks are separate functions.** `cc20bytes.check_key`,
+   `cc20bytes.check_nonce` and `cc20x.check_xnonce` each answer `?Cc20Error`.
+   Every function a program ordinarily calls — `seal`, `open`, `xseal`, `xopen`
+   — performs them itself, so the only way to reach an unchecked constructor is
+   to call it deliberately.
 
-The first two take no `Bytes`, no `Str` and no list at all: a state is
-`[Int; 16]` inside a `@value`, a Poly1305 block is `[Int; 4]` inside
-one, and every function between them is word algebra.  Sixty-four bytes
-of stack for the cipher, a hundred and twelve for the authenticator,
-and the arena untouched.  `tests/embedded_probe.nv` builds them for a
-Cortex-M4 and the `core-embedded` shard row runs it, so the claim is
-**built rather than asserted**.
+A word on the shape of the streaming interface. `Cc20State` is a plain value
+struct: sixteen words in the caller's own stack frame, with no heap cell, no
+header and no reference count. The language does not admit such a struct as a
+`Result` payload (SPEC section 14.5), so `apply_into` cannot hand back the
+advanced state. `advance` is what replaces that, and the same constraint is why
+`cc20bytes.state_from` cannot refuse a 16-byte key and so does not pretend to.
 
-The other three speak `Bytes` and `Cursor`, which are heap objects.  A
-device that wants the whole AEAD drives it out of the first two:
-`poly_key_for` is a keystream block, and RFC 8439 § 2.8's framing is
-`absorb_pad` and `absorb_lengths`, both public for exactly that reason.
+## Running on a microcontroller
 
-The split is crypto-nv's — `sha256_core` beside `hashing` — under this
-package's names, and it is why the device claim is honest rather than
-the whole package waving at a tier.
+novo-lang lets a package state which of its modules can run on a device with no
+heap allocator, and the registry checks that claim by compiling a probe program
+for a Cortex-M4. Here the claim covers `chacha20` and `poly1305`.
 
-## What is constant time, and what is not
+Those two modules take no `Bytes`, no `Str` and no list at all. A cipher state
+is `[Int; 16]` inside a plain value struct, a Poly1305 block is `[Int; 4]`
+inside one, and every function between them is word algebra. Sixty-four bytes of
+stack for the cipher, a hundred and twelve for the authenticator, and the heap
+untouched. `tests/embedded_probe.nv` builds them for the device on every test
+run, so the claim is built rather than asserted.
 
-A crypto package that does not say is a crypto package a reviewer
-cannot use.
+The other three modules speak `Bytes` and `Cursor`, which are heap objects. A
+device that wants the whole AEAD drives it out of the first two: `poly_key_for`
+is a keystream block, and RFC 8439 section 2.8's framing is `absorb_pad` and
+`absorb_lengths`, both public for exactly that reason.
 
-**Constant time.**  `block`, `quarter_round`, `double_round` and
-`hchacha20` are constant time *by construction*: addition, XOR and
-rotation by constant amounts, no branch on a key bit, no table, no
-data-dependent index.  `absorb`, `absorb_last` and the Poly1305
-arithmetic are multiply-add-carry with no branch on message or key
-content.  `tag_matches` is crypto-nv's `digest.ct_eq` and
-`poly1305.chunk_eq` is its device-tier counterpart — four word
-comparisons folded with OR, never short-circuited, because an `&&`
-chain returns early on the first differing word and tells an attacker
-how many they have guessed.
+## Timing behaviour
 
-**Not constant time, and not secret.**  `state_word`, `block_word`,
-`block_byte`, `chunk_word` and `chunk_byte` index an inline array with
-an index the *caller* chose.  Nothing in this package passes a secret
-as an index.  Message *lengths* are not secret either — `absorb_last`
-takes one, `seal_len` returns one, and every construction here reveals
-the plaintext length by construction.
+**Constant time by construction.** `block`, `quarter_round`, `double_round` and
+`hchacha20` use addition, XOR and rotation by constant amounts. No branch
+depends on a key bit, no table is consulted and no array is indexed by secret
+data. `absorb`, `absorb_last` and the Poly1305 arithmetic are multiply, add and
+carry, with no branch on message or key content.
 
-**A requirement on the implementation, not on the signature.**  The
-final reduction in `tag` does a conditional subtraction of 2^130 - 5,
-and it has to be done with a mask rather than an `if`.  A signature
-cannot carry that, so it is written in `poly1305`'s module header where
-the lane that writes the body will read it.
+**Tag comparison.** `tag_matches` is crypto-nv's `digest.ct_eq`, and
+`poly1305.chunk_eq` is its counterpart for the device modules: four word
+comparisons folded with OR, never short-circuited. An `&&` chain returns early
+on the first differing word and tells an attacker how many they have guessed.
 
-**What this package does not do.**  It does not zero a buffer after
-use.  `Bytes` is the caller's and the caller decides its lifetime; a
-`@value` state is in a stack frame the compiler owns and there is no
-portable way to promise the frame is scrubbed.  A program that needs
-that needs it at a layer that can guarantee it.
+**Indexed by the caller, not by a secret.** `state_word`, `block_word`,
+`block_byte`, `chunk_word` and `chunk_byte` index an inline array with an index
+the caller chose. Nothing in this package passes a secret as an index.
 
-## The nonce is never this package's to choose
+**Message lengths are not secret.** `absorb_last` takes one, `seal_len` returns
+one, and every construction here reveals the plaintext length anyway.
 
-A repeated nonce under one key destroys ChaCha20-Poly1305 completely —
-not degrades it.  Two ciphertexts under the same nonce XOR to the XOR
-of their plaintexts, and because the Poly1305 key is derived from the
-key *and the nonce*, two tags under a repeated nonce leak the
-authentication key itself.  After that anything can be forged.
+**A requirement on the implementation.** The final reduction in `tag` performs a
+conditional subtraction of 2¹³⁰ − 5, and it must be done with a mask rather than
+an `if`. A signature cannot carry that requirement, so it is written in
+`poly1305`'s module header.
 
-There is no counter hidden in this package that could stop that, and no
-`[rand]` row that could pick one: a `core` package has neither.  The
-two disciplines that work:
+**Buffers are not zeroed after use.** A `Bytes` belongs to the caller, who
+decides its lifetime. A plain value state lives in a stack frame the compiler
+owns, and there is no portable way to promise that frame is scrubbed. A program
+that needs that guarantee needs it from a layer that can give it.
 
-- **A counter you keep**, for the 96-bit nonce.  It has to survive
-  restarts, replicas and restored backups, which is the operational
-  problem that produces nonce reuse in the field.
-- **A 192-bit nonce picked at random**, with `cc20x`.  96 bits is too
-  few to pick at random — the birthday bound is around 2^48 messages,
-  which a busy service reaches — and 192 bits is not: 2^96, which
-  nothing reaches.  That is the whole reason XChaCha20 exists, and why
-  paseto-nv's `v4.local` and age-nv's stanzas use it.
+## What is not included
 
-`CC20P_MAX_MESSAGE_BYTES` is the other ceiling: 2^38 - 64 bytes, 256
-GiB less a block, under one key and nonce.  Past it the block counter
-wraps and the keystream repeats.  `apply_into` refuses before it writes
-rather than wrapping, which is why `advance` cannot fail.
+- **ChaCha8 and ChaCha12.** RFC 8439 specifies twenty rounds, and offering fewer
+  would offer a choice a caller has no way to make.
+- **The original ChaCha20 with a 64-bit nonce**, from the 2008 paper. Only a
+  legacy protocol wants it.
+- **Salsa20**, the same author's earlier design. A separate package if anyone
+  needs it.
+- **Key derivation.** That is [hkdf-nv](https://novo-lang.org/packages/hkdf-nv).
+- **A random number generator or a nonce counter.** See rule 3.
+- **Buffer zeroing.** See "Timing behaviour".
 
-## The layer, and why
+## Related packages
 
-`core` — no effects.  The key, the nonce and the counter all arrive as
-arguments; nothing here reads entropy, consults a clock or opens a
-file.  That is what lets the same code run in firmware and in a request
-handler, and it is why the entropy question above is answered by the
-caller rather than hidden.
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) is the only dependency,
+  and supplies one function: `digest.ct_eq`, the constant-time byte comparison
+  that `cc20aead.open` uses to check a tag. A tag comparison that returns early
+  is the classic forgery oracle, and there should be one such loop on the
+  registry for a reviewer to read rather than one per package. Nothing else is
+  taken from crypto-nv; this package hashes nothing.
+- Four packages are written against this one: cookie-nv for its AEAD, smp-nv for
+  Bluetooth pairing, age-nv whose payload is this construction in chunks, and
+  paseto-nv whose `v4.local` token is `cc20x.xseal`. All four pass their own
+  buffers, and none of them allocates in the cipher.
 
-One dependency, `crypto-nv`, for one function: `digest.ct_eq`.  A tag
-comparison that returns early is the classic AEAD forgery oracle, and
-there should be **one** such loop on the grid for a reviewer to read
-rather than one per package.  crypto-nv is `core`, so `dep-layer`
-holds.
+## Test vectors
 
-## The reference implementation
+RFC 8439 is the oracle, section by section, so a failing assertion names the
+paragraph the implementation disagrees with: section 2.1.1's quarter round,
+section 2.3.2's block, section 2.4.2's encryption, section 2.5.2's MAC,
+section 2.6.2's one-time key and section 2.8.2's AEAD. XChaCha20's vectors come
+from draft-irtf-cfrg-xchacha section 2.2.2.
 
-RustCrypto's `chacha20poly1305` and `chacha20` for the surface split
-between a raw cipher and an AEAD, and libsodium for the XChaCha20
-construction as it is actually deployed.  The oracle is RFC 8439
-itself: § 2.1.1's quarter round, § 2.3.2's block, § 2.4.2's encryption,
-§ 2.5.2's MAC, § 2.6.2's one-time key and § 2.8.2's AEAD are the test
-suite, section by section, so a failing assertion names the paragraph
-the implementation disagrees with.  XChaCha20's vectors are
-draft-irtf-cfrg-xchacha § 2.2.2's.
+RustCrypto's `chacha20poly1305` and `chacha20` crates are the reference for the
+split between a raw cipher and an AEAD, and libsodium for the XChaCha20
+construction as it is actually deployed.
 
-**XChaCha20 is a draft, not an RFC**, and has been for years.  It is
-stable, unchanged and deployed — libsodium, age and PASETO v4 all ship
-it — and the README says so here rather than letting a reader discover
-it from a dead link.
+XChaCha20 is an Internet-Draft rather than an RFC, and has been for years. It is
+stable, unchanged and deployed: libsodium, age and PASETO v4 all ship it. This
+is said here rather than left for a reader to discover from a dead link.
 
-Deliberately not ported: ChaCha8 and ChaCha12, because RFC 8439
-specifies twenty rounds and a package offering fewer would be offering
-a choice a caller has no way to make; the original 64-bit-nonce
-ChaCha20 of the 2008 paper, which only a legacy protocol wants;
-Salsa20, which is the same author's earlier design and a different
-package if anyone ever needs it; and key derivation, which is
-hkdf-nv's.
+## Implementation status
 
-## Status
+Every function is a `todo()`. `novo test --isolate` runs the suite and every
+assertion reaches `not implemented: chacha20-nv.<module>.<fn>`.
 
-Every function is `todo()`.  `novo test --isolate` runs the API suite
-and every assertion reaches `not implemented: chacha20-nv.<module>.<fn>`.
-
-| module | public types | public items | implemented |
+| Module | Public types | Public items | Implemented |
 | --- | --- | --- | --- |
-| `chacha20` | `Cc20State`, `Cc20Block`, `Cc20Sub` | 6 consts, 15 fns | no |
-| `poly1305` | `Cc20Poly`, `Cc20Chunk` | 3 consts, 15 fns | no |
-| `cc20bytes` | — | 9 fns | no |
-| `cc20aead` | — | 4 consts, 11 fns | no |
-| `cc20x` | — | 2 consts, 6 fns | no |
-| `cc20err` | `Cc20Error` (+ `impl Error`) | 2 fns | no |
-
-Six public types, 58 public functions, 15 public constants and one
-trait impl.
-
-**The consumers are named rows, not hypotheticals.**  cookie-nv named
-this package as its missing AEAD; smp-nv's BLE pairing wants one;
-age-nv's payload is this construction chunked; paseto-nv's `v4.local`
-is `cc20x.xseal`.  All four are `core`, all four pass their own
-buffers, and none of them allocates in the cipher.
+| `chacha20` | `Cc20State`, `Cc20Block`, `Cc20Sub` | 6 constants, 15 functions | no |
+| `poly1305` | `Cc20Poly`, `Cc20Chunk` | 3 constants, 15 functions | no |
+| `cc20bytes` | — | 9 functions | no |
+| `cc20aead` | — | 4 constants, 11 functions | no |
+| `cc20x` | — | 2 constants, 6 functions | no |
+| `cc20err` | `Cc20Error` (with `impl Error`) | 2 functions | no |
 
 ## Licence
 
