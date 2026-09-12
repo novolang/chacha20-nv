@@ -1,0 +1,91 @@
+// cc20err.nv — one error type for the whole package.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// TWO KINDS OF REFUSAL, AND ONLY ONE OF THEM IS INTERESTING.  Most of
+// the variants below are a caller's own mistake — a key of the wrong
+// width, an output buffer too small, a message past the counter's
+// ceiling — and every one of them carries the numbers, so the message
+// a log shows names what was wrong rather than that something was.
+//
+// `Cc20TagMismatch` is the other kind and it carries NOTHING on
+// purpose.  There is exactly one thing a caller may learn from a
+// failed `open` — that it failed — and a variant with a position, a
+// byte count or a partial plaintext in it would be handing an attacker
+// the oracle the constant-time comparison exists to close.  It is also
+// why `open` writes nothing at all on failure rather than writing the
+// decrypted bytes and then reporting: a caller that got a buffer full
+// of plaintext back with an `Err` beside it would use it eventually.
+
+// What this package refuses, and why.
+pub enum Cc20Error
+    // A key that is not 32 bytes reached a constructor.
+    Cc20KeyLengthWrong(got: Int, want: Int)
+    // A nonce that is not the width this construction takes — 12 bytes
+    // for ChaCha20-Poly1305, 24 for XChaCha20-Poly1305.
+    Cc20NonceLengthWrong(got: Int, want: Int)
+    // The caller's output buffer has fewer bytes left than the call
+    // needs.  `cc20aead.seal_len` prices a seal before it is attempted,
+    // so a caller never has to discover this by trying.
+    Cc20OutputTooSmall(want: Int, have: Int)
+    // `open` was given fewer than 16 bytes, so there is not even a tag
+    // there.
+    Cc20CiphertextTooShort(got: Int, want: Int)
+    // The message would take the block counter past 2^32, where the
+    // keystream repeats.  256 GiB under one key and nonce is the
+    // ceiling; a caller with more data than that needs a second nonce,
+    // which is what age-nv's STREAM chunking does.
+    Cc20MessageTooLong(got: Int, limit: Int)
+    // The tag did not match.  NOTHING ELSE IS SAID, and nothing was
+    // written to the caller's buffer.
+    Cc20TagMismatch
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.
+//
+// `Result<_, Cc20Error>` requires it: SPEC § 3.4 admits a `Result`
+// error type only if it implements `Error`, so this impl is what lets
+// every function in the package name its own refusal instead of
+// returning `Result<_, Str>`.
+//
+// ```novo
+// use cc20err
+//
+// fn main() [io]
+//     println(cc20err.describe(Cc20TagMismatch))
+// ```
+impl Error for Cc20Error
+    fn message(self) -> Str
+        todo("chacha20-nv.cc20err.Cc20Error.message")
+
+// The same sentence as `message`, as a free function, for a caller
+// that has an error value rather than a `Result` to call `.message()`
+// on.
+//
+// ```novo
+// use cc20err
+//
+// fn main() [io]
+//     println(cc20err.describe(Cc20KeyLengthWrong(16, 32)))
+// ```
+pub fn describe(e: Cc20Error) -> Str []
+    todo("chacha20-nv.cc20err.describe")
+
+// Whether an error means "this ciphertext is not authentic" as opposed
+// to "this call was made wrong".
+//
+// The distinction a caller acts on: a `Cc20TagMismatch` is a security
+// event to count and rate-limit, and every other variant is a bug in
+// the program to fix.  A service that logged them the same way would
+// either drown its alerts in its own mistakes or miss an attack in
+// them.
+//
+// ```novo
+// use cc20err
+//
+// fn main() [io]
+//     println("${cc20err.is_authentication_failure(Cc20TagMismatch)}")   // true
+// ```
+pub fn is_authentication_failure(e: Cc20Error) -> Bool []
+    todo("chacha20-nv.cc20err.is_authentication_failure")

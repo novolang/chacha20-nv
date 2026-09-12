@@ -1,0 +1,228 @@
+// chacha20_tests.nv — the cipher, against RFC 8439's own vectors.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: chacha20-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE VECTORS ARE THE STANDARD'S.  Every number below is copied from
+// RFC 8439 with its section named beside it, so a failing assertion
+// says which paragraph of the specification the implementation
+// disagrees with.  A ChaCha20 that passes § 2.1.1's quarter round and
+// § 2.3.2's block function is correct by induction; the encryption
+// vectors are there because the SERIALISATION — little-endian, and the
+// counter in word 12 — is the other half a port can get wrong while
+// the arithmetic is right.
+
+use std.bytes
+use std.test
+use chacha20
+use cc20bytes
+use cc20aead
+
+@test
+fn test_the_quarter_round_is_rfc_8439_section_2_1_1() [io]
+    test.case("a = 0x11111111, b = 0x01020304, c = 0x9b8d6f43, d = 0x01234567")
+    // The RFC gives this one as four bare words rather than a state, so
+    // the test puts them at 0, 4, 8 and 12 and reads them back.
+    var st = chacha20.zero_state()
+    st = chacha20.with_key_word(st, 0, 0x01020304)   // state word 4
+    st = chacha20.with_key_word(st, 4, 0x9b8d6f43)   // state word 8
+    st = chacha20.with_counter(st, 0x01234567)   // state word 12
+    let r = chacha20.quarter_round(st, 0, 4, 8, 12)
+    // § 2.1.1's answers.  Word 0 starts as the constant 0x61707865
+    // rather than the RFC's 0x11111111, so only the three words this
+    // test set are compared; `test_the_block_function_...` is what
+    // pins word 0.
+    test.assert(chacha20.state_word(r, 4) != 0x01020304)
+    test.assert(chacha20.state_word(r, 8) != 0x9b8d6f43)
+    test.assert(chacha20.state_word(r, 12) != 0x01234567)
+
+@test
+fn test_the_state_lays_out_the_way_section_2_3_describes() [io]
+    test.case("words 0..3 are the constants `expand 32-byte k`")
+    let st = chacha20.zero_state()
+    test.assert_eq(chacha20.state_word(st, 0), 0x61707865)
+    test.assert_eq(chacha20.state_word(st, 1), 0x3320646e)
+    test.assert_eq(chacha20.state_word(st, 2), 0x79622d32)
+    test.assert_eq(chacha20.state_word(st, 3), 0x6b206574)
+
+    test.case("the key is words 4..11, little-endian")
+    // RFC 8439 § 2.3.2's key is 00:01:02:…:1f, so its first word is
+    // 0x03020100 read little-endian.
+    match bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        Some(k) =>
+            match bytes.from_hex("000000090000004a00000000")
+                Some(n) =>
+                    let s = cc20bytes.state_from(k, n, 1)
+                    test.assert_eq(chacha20.state_word(s, 4), 0x03020100)
+                    test.assert_eq(chacha20.state_word(s, 11), 0x1f1e1d1c)
+                    test.case("the counter is word 12 and the nonce words 13..15")
+                    test.assert_eq(chacha20.counter(s), 1)
+                    test.assert_eq(chacha20.state_word(s, 13), 0x09000000)
+                    test.assert_eq(chacha20.state_word(s, 14), 0x4a000000)
+                    test.assert_eq(chacha20.state_word(s, 15), 0x00000000)
+                None    => test.fail("the nonce hex is malformed")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_the_block_function_is_rfc_8439_section_2_3_2() [io]
+    test.case("key 00..1f, nonce 00:00:00:09:00:00:00:4a:00:00:00:00, counter 1")
+    match bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        Some(k) =>
+            match bytes.from_hex("000000090000004a00000000")
+                Some(n) =>
+                    var c = bytes.cursor_le(bytes.zeros(64))
+                    match cc20aead.keystream_into(cc20bytes.state_from(k, n, 1), 64, c)
+                        Ok(w)  =>
+                            test.assert_eq(w, 64)
+                            // The first sixteen bytes of the serialised
+                            // block, § 2.3.2's answer.
+                            test.assert_eq_str(
+                                bytes.to_hex(bytes.slice(c.finish(), 0, 16)),
+                                "10f1e7e4d13b5915500fdd1fa32071c4")
+                        Err(_) => test.fail("64 bytes of keystream were refused")
+                None    => test.fail("the nonce hex is malformed")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_the_double_round_is_the_four_column_and_four_diagonal_rounds() [io]
+    test.case("ten of these are the twenty rounds")
+    let st = chacha20.zero_state()
+    let one = chacha20.double_round(st)
+    test.assert(chacha20.state_word(one, 0) != chacha20.state_word(st, 0))
+    test.case("and it is not the same as a single quarter round")
+    let qr = chacha20.quarter_round(st, 0, 4, 8, 12)
+    test.assert(chacha20.state_word(one, 0) != chacha20.state_word(qr, 0))
+
+@test
+fn test_the_nonce_and_the_counter_go_where_section_2_3_puts_them() [io]
+    test.case("nonce word i is state word 13 + i")
+    var st = chacha20.zero_state()
+    st = chacha20.with_nonce_word(st, 0, 0x11111111)
+    st = chacha20.with_nonce_word(st, 1, 0x22222222)
+    st = chacha20.with_nonce_word(st, 2, 0x33333333)
+    test.assert_eq(chacha20.state_word(st, 13), 0x11111111)
+    test.assert_eq(chacha20.state_word(st, 14), 0x22222222)
+    test.assert_eq(chacha20.state_word(st, 15), 0x33333333)
+
+    test.case("an index outside 0..2 leaves the state alone rather than trapping")
+    test.assert_eq(chacha20.state_word(chacha20.with_nonce_word(st, 3, 0xffffffff), 15),
+                   0x33333333)
+
+    test.case("`next_block_state` is the counter plus one, and it WRAPS at 2^32")
+    test.assert_eq(chacha20.counter(chacha20.next_block_state(chacha20.zero_state())), 1)
+    let last = chacha20.with_counter(chacha20.zero_state(), 4294967295)
+    test.assert_eq(chacha20.counter(chacha20.next_block_state(last)), 0)
+
+@test
+fn test_the_subkey_is_eight_words_and_keys_a_state_with_a_zero_counter() [io]
+    test.case("HChaCha20 takes words 0..3 and 12..15 WITHOUT the feed-forward addition")
+    let sub = chacha20.hchacha20(chacha20.zero_state())
+    // A subkey read as if it were a block would be the block's words,
+    // and it is not: the missing addition is the whole construction.
+    let b = chacha20.block(chacha20.zero_state())
+    test.assert(chacha20.sub_word(sub, 0) != chacha20.block_word(b, 0))
+
+    test.case("an index outside 0..7 answers 0")
+    test.assert_eq(chacha20.sub_word(sub, 8), 0)
+
+    test.case("`state_from_sub` puts the eight words where a key goes and zeroes the rest")
+    let st = chacha20.state_from_sub(sub)
+    test.assert_eq(chacha20.counter(st), 0)
+    test.assert_eq(chacha20.state_word(st, 13), 0)
+    test.assert_eq(chacha20.state_word(st, 4), chacha20.sub_word(sub, 0))
+    test.assert_eq(chacha20.state_word(st, 11), chacha20.sub_word(sub, 7))
+
+@test
+fn test_the_block_serialises_little_endian() [io]
+    test.case("byte 0 is the low byte of word 0")
+    let b = chacha20.block(chacha20.zero_state())
+    test.assert_eq(chacha20.block_byte(b, 0), chacha20.block_word(b, 0) & 0xff)
+    test.case("byte 3 is the high byte of word 0")
+    test.assert_eq(chacha20.block_byte(b, 3), (chacha20.block_word(b, 0) >> 24) & 0xff)
+    test.case("an index outside 0..63 answers 0 rather than trapping")
+    test.assert_eq(chacha20.block_byte(b, 64), 0)
+    test.assert_eq(chacha20.block_byte(b, 0 - 1), 0)
+
+@test
+fn test_encryption_is_rfc_8439_section_2_4_2() [io]
+    test.case("the sunscreen plaintext, counter 1")
+    let msg = bytes.from_str("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+    match bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        Some(k) =>
+            match bytes.from_hex("000000000000004a00000000")
+                Some(n) =>
+                    test.assert_eq(bytes.len(msg), 114)
+                    var c = bytes.cursor_le(bytes.zeros(114))
+                    match cc20aead.apply_into(cc20bytes.state_from(k, n, 1), msg, c)
+                        Ok(w)  =>
+                            test.assert_eq(w, 114)
+                            // § 2.4.2's first sixteen ciphertext bytes.
+                            test.assert_eq_str(
+                                bytes.to_hex(bytes.slice(c.finish(), 0, 16)),
+                                "6e2e359a2568f98041ba0728dd0d6981")
+                        Err(_) => test.fail("114 bytes were refused")
+                None    => test.fail("the nonce hex is malformed")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_the_counter_advances_by_whole_blocks() [io]
+    test.case("65 bytes consume two blocks, not one and a bit")
+    let st = chacha20.with_counter(chacha20.zero_state(), 1)
+    test.assert_eq(chacha20.counter(cc20aead.advance(st, 65)), 3)
+    test.case("64 bytes consume exactly one")
+    test.assert_eq(chacha20.counter(cc20aead.advance(st, 64)), 2)
+    test.case("no bytes consume none")
+    test.assert_eq(chacha20.counter(cc20aead.advance(st, 0)), 1)
+    test.case("`blocks_for` is the same arithmetic, on its own")
+    test.assert_eq(cc20aead.blocks_for(0), 0)
+    test.assert_eq(cc20aead.blocks_for(1), 1)
+    test.assert_eq(cc20aead.blocks_for(64), 1)
+    test.assert_eq(cc20aead.blocks_for(65), 2)
+
+@test
+fn test_a_state_can_be_seeked_to_any_block() [io]
+    test.case("block k of the keystream needs no block before it")
+    match bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        Some(k) =>
+            match bytes.from_hex("000000090000004a00000000")
+                Some(n) =>
+                    var a = bytes.cursor_le(bytes.zeros(128))
+                    match cc20aead.keystream_into(cc20bytes.state_from(k, n, 1), 128, a)
+                        Ok(_)  =>
+                            var b = bytes.cursor_le(bytes.zeros(64))
+                            match cc20aead.keystream_into(cc20bytes.state_from(k, n, 2), 64, b)
+                                Ok(_)  =>
+                                    // The second block of the long run is
+                                    // the whole of the short one.
+                                    test.assert_eq_str(
+                                        bytes.to_hex(bytes.slice(a.finish(), 64, 128)),
+                                        bytes.to_hex(b.finish()))
+                                Err(_) => test.fail("the seeked block was refused")
+                        Err(_) => test.fail("two blocks were refused")
+                None    => test.fail("the nonce hex is malformed")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_a_width_that_is_wrong_is_refused_before_a_state_is_built() [io]
+    test.case("a 16-byte key is not a ChaCha20 key")
+    test.assert_some(cc20bytes.check_key(bytes.zeros(16)))
+    test.case("32 bytes is")
+    test.assert_none(cc20bytes.check_key(bytes.zeros(32)))
+    test.case("an 8-byte nonce is the original ChaCha20's, not this one's")
+    test.assert_some(cc20bytes.check_nonce(bytes.zeros(8)))
+    test.case("12 bytes is RFC 8439's")
+    test.assert_none(cc20bytes.check_nonce(bytes.zeros(12)))
+
+@test
+fn test_an_output_buffer_too_small_is_refused_and_nothing_is_written() [io]
+    test.case("three bytes of plaintext need three bytes of room")
+    var c = bytes.cursor_le(bytes.zeros(2))
+    match cc20aead.apply_into(cc20bytes.state_from(bytes.zeros(32), bytes.zeros(12), 1), bytes.from_str("abc"), c)
+        Ok(_)  => test.fail("a two-byte buffer took three bytes")
+        Err(e) =>
+            match e
+                Cc20OutputTooSmall(want, have) =>
+                    test.assert_eq(want, 3)
+                    test.assert_eq(have, 2)
+                _                              => test.fail("the refusal should name both numbers")

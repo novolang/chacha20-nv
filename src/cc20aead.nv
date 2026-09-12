@@ -1,0 +1,312 @@
+// cc20aead.nv — the stream cipher over a caller's buffer, and the
+// AEAD of RFC 8439 § 2.8.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE LOAD-BEARING SHAPE: A FALLIBLE CALL ANSWERS A COUNT, AND THE
+// STATE MOVES BY A PURE FUNCTION.
+//
+// `Cc20State` is a `@value`, and a `@value` cannot be a `Result`
+// payload (SPEC § 14.5).  So `apply_into` cannot hand back the
+// advanced state, and the shape that replaces it is better than the
+// one it could not have: the call answers the BYTE COUNT it wrote, and
+// `advance` moves the counter by that count.  A caller reads
+//
+//     let n  = cc20aead.apply_into(st, chunk, dst)!
+//     let st = cc20aead.advance(st, n)
+//
+// where the two facts a streaming cipher has to keep straight — how
+// much went out, and where the keystream is now — are two values on
+// two lines rather than one tuple that has to be destructured
+// correctly.  It also means a caller may advance the state WITHOUT
+// producing output, which is exactly what seeking into the middle of a
+// file needs and what a fused call could not express.
+//
+// EVERYTHING WRITES INTO THE CALLER'S BUFFER.  Nothing here allocates
+// a result.  `seal_len` and `open_len` price a call before it is made,
+// so a caller sizes one buffer, and on any refusal NOTHING is written.
+//
+// WHAT THIS IS FOR, in one line: cookie-nv named `chacha20-nv` as its
+// missing AEAD, smp-nv's BLE pairing wants one, age-nv's payload is
+// this construction chunked, and paseto-nv's v4.local is XChaCha20
+// from `cc20x`.  All four are `core`, all four pass their own buffers,
+// and none of them allocates in the cipher.
+
+use std.bytes
+use chacha20
+use cc20bytes
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The AEAD tag, in bytes: sixteen.
+pub const CC20P_TAG_BYTES = 16
+
+// The AEAD nonce, in bytes: twelve.
+pub const CC20P_NONCE_BYTES = 12
+
+// The key, in bytes: thirty-two.
+pub const CC20P_KEY_BYTES = 32
+
+// The most bytes one key and nonce may cover: 274877906880, which is
+// 2^38 - 64, or 256 GiB less one block.
+//
+// RFC 8439 § 2.8's ceiling, and the reason it is not the counter's
+// full 2^32 blocks: the AEAD spends block 0 on the Poly1305 key, so
+// the message gets blocks 1 .. 2^32-1.
+pub const CC20P_MAX_MESSAGE_BYTES = 274877906880
+
+// ── The raw stream cipher ────────────────────────────────────────────
+
+// `src` XORed with the keystream from `st`, written at `dst`'s
+// position; the count written comes back.
+//
+// The bare cipher of RFC 8439 § 2.4 — NO AUTHENTICATION.  A caller
+// using this alone gets confidentiality and nothing else: an attacker
+// who can flip a ciphertext bit flips the same plaintext bit, and
+// nothing notices.  Use `seal` unless you are building an
+// authenticated construction of your own, as age-nv and paseto-nv do.
+//
+// The state does not move; `advance` is the next call.  Refusals write
+// NOTHING: `Cc20OutputTooSmall` when `dst` has less room than `src`
+// has bytes, and `Cc20MessageTooLong` when `src` would take the
+// counter past 2^32.
+//
+// ```novo
+// use std.bytes
+// use cc20bytes
+// use cc20aead
+//
+// fn main() [io]
+//     var c  = bytes.cursor_le(bytes.zeros(3))
+//     let st = cc20bytes.state_from(bytes.zeros(32), bytes.zeros(12), 1)
+//     match cc20aead.apply_into(st, bytes.from_str("abc"), c)
+//         Ok(n)  => println("${n}")                // 3
+//         Err(_) => println("refused")
+// ```
+pub fn apply_into(st: Cc20State, src: Bytes, mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20aead.apply_into")
+
+// `n` bytes of raw keystream written at `dst`'s position; the count
+// comes back.
+//
+// `apply_into` with an all-zero `src`, without the zeros.  What a
+// caller deriving key material wants — a subkey, a Poly1305 key, a
+// STREAM nonce — and what a test comparing against RFC 8439 § 2.4.2's
+// keystream vector calls.
+//
+// ```novo
+// use std.bytes
+// use cc20bytes
+// use cc20aead
+//
+// fn main() [io]
+//     var c  = bytes.cursor_le(bytes.zeros(64))
+//     let st = cc20bytes.state_from(bytes.zeros(32), bytes.zeros(12), 0)
+//     match cc20aead.keystream_into(st, 64, c)
+//         Ok(n)  => println("${n}")                // 64
+//         Err(_) => println("refused")
+// ```
+pub fn keystream_into(st: Cc20State, n: Int, mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20aead.keystream_into")
+
+// The state `n` bytes further along: the counter plus `ceil(n / 64)`.
+//
+// The other half of the shape the module header describes.  It cannot
+// fail and it does not need to: a counter past 2^32 is refused by
+// `apply_into` BEFORE it writes, so a caller that checks its results
+// never advances past the ceiling, and one that ignores them has
+// already been told.
+//
+// `n` that is not a multiple of 64 rounds UP, because a partial block
+// consumed a whole block of keystream and the next call must not reuse
+// it.  That rounding is the single most common ChaCha20 streaming
+// defect.
+//
+// ```novo
+// use std.bytes
+// use chacha20
+// use cc20bytes
+// use cc20aead
+//
+// fn main() [io]
+//     let st = cc20bytes.state_from(bytes.zeros(32), bytes.zeros(12), 1)
+//     println("${chacha20.counter(cc20aead.advance(st, 65))}")   // 3
+// ```
+pub fn advance(st: Cc20State, bytes_done: Int) -> Cc20State []
+    todo("chacha20-nv.cc20aead.advance")
+
+// How many blocks `n` bytes consume: `ceil(n / 64)`.
+//
+// Public because a caller sizing a nonce schedule — age-nv's STREAM,
+// a disk encryptor — needs the same arithmetic `advance` does, and two
+// copies of it would eventually disagree.
+//
+// ```novo
+// use cc20aead
+//
+// fn main() [io]
+//     println("${cc20aead.blocks_for(65)}")        // 2
+// ```
+pub fn blocks_for(n: Int) -> Int []
+    todo("chacha20-nv.cc20aead.blocks_for")
+
+// ── The one-time key ─────────────────────────────────────────────────
+
+// The Poly1305 key for one AEAD message: the first 32 bytes of the
+// ChaCha20 keystream at counter ZERO, written into `out`.
+//
+// RFC 8439 § 2.6.  It is public because it is the step a reader most
+// needs to see to believe the one-message rule: the key is a function
+// of the ChaCha20 key AND the nonce, so a fresh nonce is a fresh
+// Poly1305 key, and a REPEATED nonce is a repeated one — which is how
+// a nonce reuse stops being "two plaintexts leak their XOR" and
+// becomes "the authentication key is recoverable and anything can be
+// forged".
+//
+// `out` must be at least 32 bytes and comes back.
+//
+// ```novo
+// use std.bytes
+// use cc20aead
+//
+// fn main() [io]
+//     let k = cc20aead.poly_key_for(bytes.zeros(32), bytes.zeros(12), bytes.zeros(32))
+//     println("${bytes.len(k)}")                   // 32
+// ```
+pub fn poly_key_for(key: Bytes, nonce: Bytes, out: Bytes) -> Bytes []
+    todo("chacha20-nv.cc20aead.poly_key_for")
+
+// ── The AEAD ─────────────────────────────────────────────────────────
+
+// How many bytes `seal` writes for a plaintext of `n`: `n + 16`.
+//
+// Call it before `seal` and size one buffer; `seal` refuses a smaller
+// one rather than writing a truncated ciphertext.
+//
+// ```novo
+// use cc20aead
+//
+// fn main() [io]
+//     println("${cc20aead.seal_len(114)}")         // 130
+// ```
+pub fn seal_len(plaintext_len: Int) -> Int []
+    todo("chacha20-nv.cc20aead.seal_len")
+
+// How many bytes `open` writes for a ciphertext of `n`: `n - 16`, or
+// `Cc20CiphertextTooShort` below 16.
+//
+// ```novo
+// use cc20aead
+//
+// fn main() [io]
+//     match cc20aead.open_len(130)
+//         Ok(n)  => println("${n}")                // 114
+//         Err(_) => println("too short")
+// ```
+pub fn open_len(ciphertext_len: Int) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20aead.open_len")
+
+// Seal `plaintext` under `key` and `nonce` with `aad` authenticated
+// but not encrypted: the ciphertext followed by its 16-byte tag,
+// written at `dst`'s position, and the total count back.
+//
+// RFC 8439 § 2.8.  The tag is APPENDED rather than returned separately
+// because that is the layout every peer implementation writes and
+// every wire format expects; a caller that wants them apart slices the
+// last 16 bytes off.
+//
+// THE NONCE IS THE CALLER'S AND IT MUST NEVER REPEAT under one key.
+// There is no counter in this package that could stop you, and no
+// `[rand]` row that could pick one — a `core` package has neither.
+// The two disciplines that work are a monotonic message counter, and a
+// nonce derived from a random one per file the way age-nv's STREAM
+// does; the README states both.
+//
+// ```novo
+// use std.bytes
+// use cc20aead
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(cc20aead.seal_len(3)))
+//     match cc20aead.seal(bytes.zeros(32), bytes.zeros(12), bytes.zeros(0), bytes.from_str("abc"), c)
+//         Ok(n)  => println("${n}")                // 19
+//         Err(_) => println("refused")
+// ```
+pub fn seal(key: Bytes, nonce: Bytes, aad: Bytes, plaintext: Bytes,
+            mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20aead.seal")
+
+// Open `ciphertext` — the sealed bytes WITH their trailing tag — under
+// `key` and `nonce` with `aad`, writing the plaintext at `dst`'s
+// position and answering the count.
+//
+// THE TAG IS CHECKED BEFORE ANYTHING IS WRITTEN.  On
+// `Cc20TagMismatch`, `dst` is untouched and the error carries nothing
+// — there is exactly one bit a caller may learn from a failed open,
+// and a partial plaintext beside an `Err` is a buffer somebody will
+// eventually use.  The comparison is `tag_matches`, which is
+// crypto-nv's `digest.ct_eq`.
+//
+// ```novo
+// use std.bytes
+// use cc20aead
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(3))
+//     match cc20aead.open(bytes.zeros(32), bytes.zeros(12), bytes.zeros(0), bytes.zeros(19), c)
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("not authentic")
+// ```
+pub fn open(key: Bytes, nonce: Bytes, aad: Bytes, ciphertext: Bytes,
+            mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20aead.open")
+
+// ── The pieces, for a caller building its own construction ───────────
+
+// The AEAD's tag over `aad` and `ciphertext` under a one-time
+// Poly1305 key, written into `out`.
+//
+// The whole of RFC 8439 § 2.8's framing in one call: the additional
+// data, padded to a multiple of sixteen; the ciphertext, padded the
+// same way; then the two lengths as little-endian 64-bit numbers.  It
+// is public because age-nv and paseto-nv both authenticate bytes this
+// package did not encrypt, and because the padding is where ports go
+// wrong — an implementation that pads one half and not the other
+// disagrees with its peer and the symptom is a tag mismatch with no
+// location.
+//
+// `out` must be at least 16 bytes and comes back.
+//
+// ```novo
+// use std.bytes
+// use cc20aead
+//
+// fn main() [io]
+//     let t = cc20aead.mac_aead(bytes.zeros(32), bytes.zeros(0), bytes.zeros(114), bytes.zeros(16))
+//     println("${bytes.len(t)}")                   // 16
+// ```
+pub fn mac_aead(poly_key: Bytes, aad: Bytes, ciphertext: Bytes, out: Bytes) -> Bytes []
+    todo("chacha20-nv.cc20aead.mac_aead")
+
+// Whether two tags are equal, in time that does not depend on where
+// they differ.
+//
+// crypto-nv's `digest.ct_eq` under this package's name, and the ONLY
+// comparison in the package.  It is re-exported rather than
+// reimplemented on purpose: a tag comparison that returns early is the
+// classic AEAD forgery oracle, and there should be one such loop on
+// the grid for a reviewer to read rather than one per package.
+//
+// Buffers of different lengths answer `false`, which is not a timing
+// leak: a length is not a secret here.
+//
+// ```novo
+// use std.bytes
+// use cc20aead
+//
+// fn main() [io]
+//     println("${cc20aead.tag_matches(bytes.zeros(16), bytes.zeros(16))}")   // true
+// ```
+pub fn tag_matches(a: Bytes, b: Bytes) -> Bool []
+    todo("chacha20-nv.cc20aead.tag_matches")

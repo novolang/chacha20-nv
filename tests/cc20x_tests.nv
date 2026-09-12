@@ -1,0 +1,104 @@
+// cc20x_tests.nv — XChaCha20 and XChaCha20-Poly1305, against
+// draft-irtf-cfrg-xchacha's own vectors.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: chacha20-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE HCHACHA20 VECTOR IS THE ONE TO GET RIGHT.  Everything else in
+// XChaCha20 is RFC 8439 unchanged, so a subkey that matches the draft
+// and a nonce assembled the documented way give a cipher that
+// interoperates; a subkey that does not gives one that is perfectly
+// self-consistent and that no other implementation can read.
+
+use std.bytes
+use std.test
+use chacha20
+use cc20x
+use cc20aead
+
+@test
+fn test_hchacha20_is_the_draft_s_section_2_2_2_vector() [io]
+    test.case("key 00..1f, 16-byte input 00:00:00:09:00:00:00:4a:00:00:00:00:31:41:59:27")
+    match bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        Some(k) =>
+            match bytes.from_hex("000000090000004a0000000031415927" + "0000000000000000")
+                Some(n) =>
+                    let sub = cc20x.subkey(k, n, bytes.zeros(32))
+                    test.assert_eq(bytes.len(sub), 32)
+                    test.assert_eq_str(
+                        bytes.to_hex(sub),
+                        "82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc")
+                None    => test.fail("the nonce hex is malformed")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_only_the_first_sixteen_nonce_bytes_reach_the_subkey() [io]
+    test.case("changing byte 16 of the nonce leaves the subkey alone")
+    match bytes.from_hex("000000090000004a00000000314159270000000000000000")
+        Some(a) =>
+            match bytes.from_hex("000000090000004a0000000031415927ff00000000000000")
+                Some(b) =>
+                    let sa = cc20x.subkey(bytes.zeros(32), a, bytes.zeros(32))
+                    let sb = cc20x.subkey(bytes.zeros(32), b, bytes.zeros(32))
+                    test.assert_eq_str(bytes.to_hex(sa), bytes.to_hex(sb))
+                    test.case("but it does change the keystream, because it is in the 96-bit nonce")
+                    var ca = bytes.cursor_le(bytes.zeros(64))
+                    var cb = bytes.cursor_le(bytes.zeros(64))
+                    match cc20aead.keystream_into(cc20x.xstate(bytes.zeros(32), a, 1), 64, ca)
+                        Ok(_)  =>
+                            match cc20aead.keystream_into(cc20x.xstate(bytes.zeros(32), b, 1), 64, cb)
+                                Ok(_)  => test.assert(bytes.to_hex(ca.finish()) != bytes.to_hex(cb.finish()))
+                                Err(_) => test.fail("64 bytes were refused")
+                        Err(_) => test.fail("64 bytes were refused")
+                None    => test.fail("the second nonce hex is malformed")
+        None    => test.fail("the first nonce hex is malformed")
+
+@test
+fn test_the_inner_nonce_is_four_zero_bytes_then_the_last_eight() [io]
+    test.case("words 13, 14 and 15 of the derived state")
+    match bytes.from_hex("000000090000004a0000000031415927" + "0001020304050607")
+        Some(n) =>
+            let st = cc20x.xstate(bytes.zeros(32), n, 1)
+            test.assert_eq(chacha20.counter(st), 1)
+            // Four zero bytes are word 13; bytes 16..19 are word 14 and
+            // bytes 20..23 word 15, both little-endian.
+            test.assert_eq(chacha20.state_word(st, 13), 0)
+            test.assert_eq(chacha20.state_word(st, 14), 0x03020100)
+            test.assert_eq(chacha20.state_word(st, 15), 0x07060504)
+        None    => test.fail("the nonce hex is malformed")
+
+@test
+fn test_the_xnonce_width_is_refused_by_name() [io]
+    test.case("24 bytes is XChaCha20's")
+    test.assert_none(cc20x.check_xnonce(bytes.zeros(24)))
+    test.case("12 bytes is RFC 8439's and is NOT accepted here")
+    test.assert_some(cc20x.check_xnonce(bytes.zeros(12)))
+    test.assert_eq(cc20x.XCC20_NONCE_BYTES, 24)
+
+@test
+fn test_xseal_and_xopen_round_trip() [io]
+    test.case("the framing is `cc20aead`'s — only the nonce is longer")
+    let pt = bytes.from_str("abc")
+    test.assert_eq(cc20aead.seal_len(3), 19)
+    var c = bytes.cursor_le(bytes.zeros(19))
+    match cc20x.xseal(bytes.zeros(32), bytes.zeros(24), bytes.zeros(0), pt, c)
+        Ok(n)  =>
+            test.assert_eq(n, 19)
+            var d = bytes.cursor_le(bytes.zeros(3))
+            match cc20x.xopen(bytes.zeros(32), bytes.zeros(24), bytes.zeros(0), c.finish(), d)
+                Ok(m)  =>
+                    test.assert_eq(m, 3)
+                    test.assert_eq_str(bytes.to_hex(d.finish()), bytes.to_hex(pt))
+                Err(_) => test.fail("what xseal wrote, xopen refused")
+        Err(_) => test.fail("a correctly sized buffer was refused")
+
+@test
+fn test_a_changed_xciphertext_is_refused() [io]
+    test.case("the tag check is the same one, and it still says nothing")
+    var d = bytes.cursor_le(bytes.zeros(3))
+    match cc20x.xopen(bytes.zeros(32), bytes.zeros(24), bytes.zeros(0), bytes.zeros(19), d)
+        Ok(_)  => test.fail("nineteen zero bytes are not a valid sealed message")
+        Err(_) =>
+            test.assert_eq_str(bytes.to_hex(d.finish()), "000000")
+            test.assert_eq(d.pos(), 0)

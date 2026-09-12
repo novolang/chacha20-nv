@@ -1,0 +1,223 @@
+// cc20bytes.nv — the bridge between a host's `Bytes` and the word
+// algebra of `chacha20` and `poly1305`.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THIS MODULE IS SEPARATE.  `chacha20` and `poly1305` are the
+// device claim: no `Bytes`, no list, no `Str`, so they cross-compile
+// on their own and `tests/embedded_probe.nv` builds them for a
+// Cortex-M4.  Everything that touches a heap object is here instead,
+// which is crypto-nv's split — `digest` beside `sha256_core` — under
+// this package's names.
+//
+// WHY THE CONSTRUCTORS DO NOT REFUSE.  A `@value` struct cannot be a
+// `Result` payload (SPEC § 14.5), so `state_from` cannot answer
+// `Result<Cc20State, Cc20Error>` and there is no version of this
+// module in which it could.  The design that falls out of that is
+// better than the one it replaced: the WIDTH CHECK is its own
+// function, `check_key` and `check_nonce`, answering `?Cc20Error`
+// before anything is built, and the constructors take what they are
+// given — a short key zero-extended, a long one truncated — and say so.
+// Every function in `cc20aead` that a program actually calls checks
+// first, so the only way to reach an unchecked constructor is to call
+// it deliberately.
+
+use std.bytes
+use chacha20
+use poly1305
+
+// ── Checking ─────────────────────────────────────────────────────────
+
+// `Some(Cc20KeyLengthWrong)` if `key` is not 32 bytes, `None` if it is.
+//
+// The refusal a `@value` constructor cannot make, as a call a caller
+// makes once.  `cc20aead.seal` and `cc20aead.open` call it themselves,
+// so this is for a caller assembling a state by hand.
+//
+// ```novo
+// use std.bytes
+// use cc20bytes
+//
+// fn main() [io]
+//     match cc20bytes.check_key(bytes.zeros(32))
+//         Some(_) => println("refused")
+//         None    => println("32 bytes")
+// ```
+pub fn check_key(key: Bytes) -> ?Cc20Error []
+    todo("chacha20-nv.cc20bytes.check_key")
+
+// `Some(Cc20NonceLengthWrong)` if `nonce` is not 12 bytes, `None` if
+// it is.
+//
+// Twelve is RFC 8439's nonce.  XChaCha20's twenty-four is
+// `cc20x.check_xnonce`, a different function, because a package with
+// one nonce check that took a width would let a caller pass the wrong
+// width and be told nothing.
+//
+// ```novo
+// use std.bytes
+// use cc20bytes
+//
+// fn main() [io]
+//     match cc20bytes.check_nonce(bytes.zeros(12))
+//         Some(_) => println("refused")
+//         None    => println("12 bytes")
+// ```
+pub fn check_nonce(nonce: Bytes) -> ?Cc20Error []
+    todo("chacha20-nv.cc20bytes.check_nonce")
+
+// ── Bytes into words ─────────────────────────────────────────────────
+
+// A ChaCha20 state from a key, a nonce and a starting block counter.
+//
+// The key is read as eight little-endian 32-bit words and the nonce as
+// three.  A key SHORTER than 32 bytes is zero-extended and a longer
+// one truncated; the same for a 12-byte nonce.  That is not a
+// convenience, it is what a `@value` return leaves available — see the
+// module header — and `check_key` and `check_nonce` are how a caller
+// refuses instead.
+//
+// ```novo
+// use std.bytes
+// use chacha20
+// use cc20bytes
+//
+// fn main() [io]
+//     let st = cc20bytes.state_from(bytes.zeros(32), bytes.zeros(12), 1)
+//     println("${chacha20.counter(st)}")           // 1
+// ```
+pub fn state_from(key: Bytes, nonce: Bytes, counter: Int) -> Cc20State []
+    todo("chacha20-nv.cc20bytes.state_from")
+
+// Sixteen bytes of `src` from `off`, as a four-word chunk.
+//
+// Bytes past the end of `src` read as zero, so a caller draining a
+// message does not need a special case for the last chunk — it pairs
+// with `poly1305.absorb_last`, which takes the real length and ignores
+// what is above it.
+//
+// ```novo
+// use std.bytes
+// use poly1305
+// use cc20bytes
+//
+// fn main() [io]
+//     let c = cc20bytes.chunk_at(bytes.zeros(16), 0)
+//     println("${poly1305.chunk_word(c, 0)}")      // 0
+// ```
+pub fn chunk_at(src: Bytes, off: Int) -> Cc20Chunk []
+    todo("chacha20-nv.cc20bytes.chunk_at")
+
+// A Poly1305 state keyed from 32 bytes: `r` clamped from the first
+// sixteen, `s` taken from the second sixteen.
+//
+// A key shorter than 32 bytes is zero-extended, for the reason
+// `state_from` gives.  ONE MESSAGE PER KEY — the module header of
+// `poly1305` says why, and `cc20aead.poly_key_for` is where a correct
+// caller gets one.
+//
+// ```novo
+// use std.bytes
+// use poly1305
+// use cc20bytes
+//
+// fn main() [io]
+//     let st = cc20bytes.poly_from(bytes.zeros(32))
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub fn poly_from(key: Bytes) -> Cc20Poly []
+    todo("chacha20-nv.cc20bytes.poly_from")
+
+// ── Words into bytes ─────────────────────────────────────────────────
+
+// The 64 keystream bytes of `b` written at `dst`'s position, and the
+// count written back.
+//
+// `Err(Cc20OutputTooSmall)` and NOTHING WRITTEN if fewer than 64 bytes
+// remain, rather than a short write the caller has to notice: a
+// truncated keystream silently encrypts the tail of a message with
+// zeros.
+//
+// ```novo
+// use std.bytes
+// use chacha20
+// use cc20bytes
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(64))
+//     match cc20bytes.block_into(chacha20.block(chacha20.zero_state()), c)
+//         Ok(n)  => println("${n}")                // 64
+//         Err(_) => println("too small")
+// ```
+pub fn block_into(b: Cc20Block, mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20bytes.block_into")
+
+// A four-word chunk's sixteen bytes written at `dst`'s position, and
+// the count written back.
+//
+// How a finished Poly1305 tag reaches a caller's buffer.
+//
+// ```novo
+// use std.bytes
+// use poly1305
+// use cc20bytes
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(16))
+//     match cc20bytes.chunk_into(poly1305.chunk_zero(), c)
+//         Ok(n)  => println("${n}")                // 16
+//         Err(_) => println("too small")
+// ```
+pub fn chunk_into(c: Cc20Chunk, mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20bytes.chunk_into")
+
+// `n` bytes of `src` from `off`, XORed with the first `n` keystream
+// bytes of `b`, written at `dst`'s position; the count comes back.
+//
+// The host's inner loop, and the one place a caller's plaintext and a
+// keystream block meet.  `n` above 64 is refused as
+// `Cc20OutputTooSmall` against the block rather than silently reusing
+// the block, because a keystream block is 64 bytes and reusing one is
+// the same catastrophe as reusing a nonce.
+//
+// ```novo
+// use std.bytes
+// use chacha20
+// use cc20bytes
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(8))
+//     let b = chacha20.block(chacha20.zero_state())
+//     match cc20bytes.xor_into(b, bytes.zeros(8), 0, 8, c)
+//         Ok(n)  => println("${n}")                // 8
+//         Err(_) => println("refused")
+// ```
+pub fn xor_into(b: Cc20Block, src: Bytes, off: Int, n: Int,
+                mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20bytes.xor_into")
+
+// ── One-shot Poly1305 ────────────────────────────────────────────────
+
+// The Poly1305 tag of `msg` under `key`, written into `out`.
+//
+// The plain § 2.5 authenticator with no AEAD framing: no padding, no
+// lengths, just the message.  RFC 8439 § 2.5.2's vector is this
+// function's test.  `out` must be at least 16 bytes and comes back, the
+// shape every writer in `std.bytes` has and the one crypto-nv's
+// `hmac_sha256` uses.
+//
+// ONE MESSAGE PER KEY.  `cc20aead.mac_aead` is what an AEAD wants;
+// this is for a caller implementing something else over Poly1305 and
+// deriving its own one-time keys.
+//
+// ```novo
+// use std.bytes
+// use cc20bytes
+//
+// fn main() [io]
+//     let t = cc20bytes.mac_into(bytes.zeros(32), bytes.from_str("abc"), bytes.zeros(16))
+//     println("${bytes.len(t)}")                   // 16
+// ```
+pub fn mac_into(key: Bytes, msg: Bytes, out: Bytes) -> Bytes []
+    todo("chacha20-nv.cc20bytes.mac_into")

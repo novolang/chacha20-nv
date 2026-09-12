@@ -1,0 +1,107 @@
+// cc20bytes_tests.nv — the bridge between a host's buffers and the
+// word algebra, and the refusals that replace a constructor's.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: chacha20-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+
+use std.bytes
+use std.test
+use chacha20
+use poly1305
+use cc20bytes
+use cc20aead
+use cc20x
+use cc20err
+
+@test
+fn test_a_block_reaches_a_caller_s_buffer_whole_or_not_at_all() [io]
+    test.case("sixty-four bytes of room takes sixty-four bytes")
+    var c = bytes.cursor_le(bytes.zeros(64))
+    match cc20bytes.block_into(chacha20.block(chacha20.zero_state()), c)
+        Ok(n)  => test.assert_eq(n, 64)
+        Err(_) => test.fail("a 64-byte buffer should take a block")
+
+    test.case("sixty-three does not, and NOTHING is written — a truncated keystream encrypts a tail with zeros")
+    var d = bytes.cursor_le(bytes.zeros(63))
+    match cc20bytes.block_into(chacha20.block(chacha20.zero_state()), d)
+        Ok(_)  => test.fail("a short buffer took a block")
+        Err(e) =>
+            match e
+                Cc20OutputTooSmall(want, have) =>
+                    test.assert_eq(want, 64)
+                    test.assert_eq(have, 63)
+                _                              => test.fail("the refusal should name both numbers")
+            test.assert_eq(d.pos(), 0)
+
+@test
+fn test_a_tag_reaches_a_caller_s_buffer_the_same_way() [io]
+    test.case("sixteen bytes of room takes sixteen")
+    var c = bytes.cursor_le(bytes.zeros(16))
+    match cc20bytes.chunk_into(poly1305.chunk_zero(), c)
+        Ok(n)  => test.assert_eq(n, 16)
+        Err(_) => test.fail("a 16-byte buffer should take a chunk")
+
+    test.case("fifteen does not")
+    var d = bytes.cursor_le(bytes.zeros(15))
+    match cc20bytes.chunk_into(poly1305.chunk_zero(), d)
+        Ok(_)  => test.fail("a short buffer took a chunk")
+        Err(_) => test.assert_eq(d.pos(), 0)
+
+@test
+fn test_the_xor_is_bounded_by_the_block_it_came_from() [io]
+    test.case("eight bytes of a block XOR eight bytes of source")
+    var c = bytes.cursor_le(bytes.zeros(8))
+    let b = chacha20.block(chacha20.zero_state())
+    match cc20bytes.xor_into(b, bytes.zeros(8), 0, 8, c)
+        Ok(n)  => test.assert_eq(n, 8)
+        Err(_) => test.fail("eight bytes were refused")
+
+    test.case("sixty-five are refused rather than reusing the block — reuse is the nonce mistake again")
+    var d = bytes.cursor_le(bytes.zeros(65))
+    match cc20bytes.xor_into(b, bytes.zeros(65), 0, 65, d)
+        Ok(_)  => test.fail("a keystream block was stretched past 64 bytes")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_aead_tag_can_be_taken_over_bytes_this_package_did_not_encrypt() [io]
+    test.case("`mac_aead` is § 2.8's framing, which age-nv and paseto-nv both need")
+    let t = cc20aead.mac_aead(bytes.zeros(32), bytes.zeros(12), bytes.zeros(114), bytes.zeros(16))
+    test.assert_eq(bytes.len(t), 16)
+
+    test.case("changing the additional data changes the tag")
+    let u = cc20aead.mac_aead(bytes.zeros(32), bytes.zeros(13), bytes.zeros(114), bytes.zeros(16))
+    test.assert(bytes.to_hex(t) != bytes.to_hex(u))
+
+    test.case("and so does moving a byte from the data to the ciphertext, because the lengths go in")
+    let v = cc20aead.mac_aead(bytes.zeros(32), bytes.zeros(11), bytes.zeros(115), bytes.zeros(16))
+    test.assert(bytes.to_hex(t) != bytes.to_hex(v))
+
+@test
+fn test_the_x_cipher_without_authentication_is_one_call() [io]
+    test.case("`xapply_into` is `xstate` and `apply_into`, for a caller that wants no intermediate")
+    var c = bytes.cursor_le(bytes.zeros(3))
+    match cc20x.xapply_into(bytes.zeros(32), bytes.zeros(24), 1, bytes.from_str("abc"), c)
+        Ok(n)  => test.assert_eq(n, 3)
+        Err(_) => test.fail("three bytes were refused")
+
+    test.case("and it agrees with driving the two halves by hand")
+    var d = bytes.cursor_le(bytes.zeros(3))
+    match cc20aead.apply_into(cc20x.xstate(bytes.zeros(32), bytes.zeros(24), 1),
+                              bytes.from_str("abc"), d)
+        Ok(_)  => test.assert_eq_str(bytes.to_hex(c.finish()), bytes.to_hex(d.finish()))
+        Err(_) => test.fail("three bytes were refused")
+
+@test
+fn test_every_refusal_says_something_a_log_can_print() [io]
+    test.case("a width names both numbers")
+    test.assert(cc20err.describe(Cc20KeyLengthWrong(16, 32)) != "")
+    test.assert(cc20err.describe(Cc20NonceLengthWrong(12, 24)) != "")
+    test.case("a buffer names what it wanted and what it had")
+    test.assert(cc20err.describe(Cc20OutputTooSmall(64, 63)) != "")
+    test.case("a ciphertext too short to hold a tag says so")
+    test.assert(cc20err.describe(Cc20CiphertextTooShort(15, 16)) != "")
+    test.case("the counter's ceiling carries both numbers")
+    test.assert(cc20err.describe(Cc20MessageTooLong(274877906881, 274877906880)) != "")
+    test.case("and the one that carries nothing still has a sentence")
+    test.assert(cc20err.describe(Cc20TagMismatch) != "")

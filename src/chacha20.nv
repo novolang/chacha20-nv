@@ -1,0 +1,422 @@
+// chacha20.nv — the ChaCha20 state and its block function, in word
+// algebra with no `Bytes` and no `Str` anywhere in the module.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THIS IS THE HALF THAT RUNS ON A DEVICE.  Everything here is a
+// `@value` struct, an inline `[Int; 16]`, `bits.*` and
+// `int.wrapping_add` — the set `@tier(embedded)` admits — so a BLE
+// peripheral or a hardware wallet drives the cipher with its arena
+// untouched.  The `Bytes` half is `cc20bytes`, one module up, and the
+// split is crypto-nv's: `sha256_core` beside `hashing`, for the same
+// reason and with the same shape.
+//
+// WHY THE KEY IS NOT A TYPE.  RFC 8439's key is thirty-two bytes and
+// nothing else, and a `Cc20Key` wrapping them would buy a caller one
+// thing — a refusal for the wrong width — which is exactly what a
+// `@value` constructor cannot return (SPEC § 14.5 keeps an unboxed
+// struct out of a `Result`).  So the width check is `cc20bytes.check_key`,
+// a function that answers `?Cc20Error` before the state is built, and
+// the state itself is the sixteen words the standard describes.
+//
+// WORDS ARE `Int`, NOT `u32`.  A word here is an `Int` carrying a
+// 32-bit pattern kept in 0 ..= 2^32-1; `mask32` re-imposes that after
+// every addition, the way crypto-nv's `word` module does.  Two 32-bit
+// addends sum to less than 2^33, so the addition itself never traps
+// (SPEC § 13.2) and only the result needs masking.
+//
+// WHAT IS CONSTANT TIME HERE, in one sentence each, because a crypto
+// package that does not say is a crypto package a reviewer cannot use:
+//
+//   * `block`, `quarter_round` and `double_round` are constant time
+//     by construction — addition, XOR and rotation by a CONSTANT
+//     amount, no branch on a key bit, no table lookup, no data-dependent
+//     index.  That is ChaCha20's whole design argument against AES in
+//     software, and it is why this package exists for a core with no
+//     AES instructions.
+//   * `hchacha20` is the same rounds and so is the same claim.
+//   * `state_word`, `block_word` and `block_byte` index an inline
+//     array with an index the CALLER chose.  They are constant time
+//     with respect to the key; they are not constant time with respect
+//     to `i`, and nothing in this package passes a secret as `i`.
+//   * Nothing here compares anything.  The tag comparison is
+//     `cc20aead.tag_matches`, which is crypto-nv's `digest.ct_eq`, and
+//     that is the only comparison in the package.
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The key, in 32-bit words: eight, which is 256 bits.
+pub const CC20_KEY_WORDS = 8
+
+// The nonce, in 32-bit words: three, which is the 96-bit nonce of
+// RFC 8439 § 2.3.  The original 64-bit ChaCha20 nonce is not this
+// package's; XChaCha20's 192-bit one is `cc20x`'s.
+pub const CC20_NONCE_WORDS = 3
+
+// The state, in 32-bit words: sixteen — four constants, eight key
+// words, one counter, three nonce words.
+pub const CC20_STATE_WORDS = 16
+
+// The keystream block, in bytes: sixty-four.
+pub const CC20_BLOCK_BYTES = 64
+
+// The rounds: twenty, as ten double rounds.  ChaCha8 and ChaCha12 are
+// not here; RFC 8439 specifies twenty and a package that offered fewer
+// would be offering a caller a choice they have no way to make.
+pub const CC20_ROUNDS = 20
+
+// The counter's ceiling: 2^32.  A single key-and-nonce pair covers
+// 2^32 blocks, which is 256 GiB, and past it the keystream repeats —
+// see `next_block_state`.
+pub const CC20_COUNTER_MODULUS = 4294967296
+
+// ── The three values ─────────────────────────────────────────────────
+
+// The ChaCha20 state: the sixteen words of RFC 8439 § 2.3, in the
+// order the standard lays them out.
+//
+// Words 0..3 are the constants `expa nd 3 2-by te k`, words 4..11 the
+// key, word 12 the block counter, words 13..15 the nonce.
+//
+// A `@value` struct, so the sixteen words live in the caller's frame —
+// no cell, no header, no reference count — and `[Int; 16]` inside one
+// is a true inline array (SPEC § 14.4).  Sixty-four bytes of stack is
+// what a device spends to hold a cipher in flight.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let st = chacha20.with_counter(chacha20.zero_state(), 1)
+//     println("${chacha20.counter(st)}")           // 1
+// ```
+pub @value
+struct Cc20State
+    // The sixteen words, masked to 32 bits.
+    w: [Int; 16]
+
+// Sixty-four bytes of keystream, as the sixteen words the block
+// function produced.
+//
+// A separate type from `Cc20State` on purpose: the two are the same
+// shape and mean opposite things — one is an input a caller may still
+// change, the other is key material that must be XORed and dropped —
+// and a program that mixed them up would encrypt with the wrong
+// counter and never notice.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let b = chacha20.block(chacha20.zero_state())
+//     println("${chacha20.block_byte(b, 0)}")
+// ```
+pub @value
+struct Cc20Block
+    // The sixteen words, in the order they serialise: word `i` is
+    // bytes `4*i .. 4*i+3`, LITTLE-endian.
+    w: [Int; 16]
+
+// The eight-word subkey HChaCha20 derives, which is what makes
+// XChaCha20's 192-bit nonce possible.
+//
+// Its own type rather than a `Cc20State`, because it is thirty-two
+// bytes of key material and not a cipher state: `cc20x.xstate` is the
+// only thing that consumes one, and it puts these words where a key
+// goes.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let s = chacha20.hchacha20(chacha20.zero_state())
+//     println("${chacha20.sub_word(s, 0)}")
+// ```
+pub @value
+struct Cc20Sub
+    // Words 0..3 and 12..15 of the finished HChaCha20 state, in that
+    // order — RFC draft-irtf-cfrg-xchacha § 2.2's selection, which is
+    // deliberately NOT the words a normal block would feed forward.
+    w: [Int; 8]
+
+// ── Building a state ─────────────────────────────────────────────────
+
+// A state with the four constants set and the key, counter and nonce
+// all zero.
+//
+// The start of the device path: a firmware image that holds its key in
+// eight words of flash chains `with_key_word` eight times rather than
+// assembling a `Bytes` it has no allocator for.  `cc20bytes.state_from`
+// is the same thing for a host that has the key as bytes.
+//
+// A ZERO KEY IS A VALID STATE and encrypts perfectly happily, which is
+// why this is named for what it is rather than called `new`: nothing
+// here checks that a caller filled it in.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     println("${chacha20.counter(chacha20.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn zero_state() -> Cc20State []
+    todo("chacha20-nv.chacha20.zero_state")
+
+// The state with key word `i` — 0 ..= 7 — replaced.
+//
+// `i` outside the range returns the state UNCHANGED rather than
+// trapping, because this is the device path and a `@value` function
+// has nowhere to put a refusal; a caller that wants the check has a
+// constant for the width.  `w` is masked to 32 bits.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let st = chacha20.with_key_word(chacha20.zero_state(), 0, 1)
+//     println("${chacha20.state_word(st, 4)}")     // 1
+// ```
+pub @tier(embedded)
+fn with_key_word(st: Cc20State, i: Int, w: Int) -> Cc20State []
+    todo("chacha20-nv.chacha20.with_key_word")
+
+// The state with nonce word `i` — 0 ..= 2 — replaced.
+//
+// THE NONCE IS NEVER THIS PACKAGE'S TO CHOOSE.  A repeated nonce under
+// one key destroys ChaCha20-Poly1305 completely: two ciphertexts XOR to
+// the XOR of their plaintexts, and the Poly1305 key is recoverable from
+// two tags, so an attacker can forge. There is no counter hidden in
+// this package that would stop that, and there is no `[rand]` row that
+// could pick one — a `core` package has neither. The caller owns the
+// nonce discipline, and the README names the two that work.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let st = chacha20.with_nonce_word(chacha20.zero_state(), 2, 7)
+//     println("${chacha20.state_word(st, 15)}")    // 7
+// ```
+pub @tier(embedded)
+fn with_nonce_word(st: Cc20State, i: Int, w: Int) -> Cc20State []
+    todo("chacha20-nv.chacha20.with_nonce_word")
+
+// The state with the block counter set to `n`, masked to 32 bits.
+//
+// RFC 8439 § 2.4 starts a message at 1 because counter 0 produced the
+// Poly1305 key; the bare stream cipher of § 2.4 starts wherever the
+// caller says, which is how a seek into the middle of a file works —
+// block `k` of the keystream is `with_counter(st, k)` and nothing
+// before it has to be computed.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     println("${chacha20.counter(chacha20.with_counter(chacha20.zero_state(), 1))}")   // 1
+// ```
+pub @tier(embedded)
+fn with_counter(st: Cc20State, n: Int) -> Cc20State []
+    todo("chacha20-nv.chacha20.with_counter")
+
+// The block counter, word 12.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     println("${chacha20.counter(chacha20.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn counter(st: Cc20State) -> Int []
+    todo("chacha20-nv.chacha20.counter")
+
+// The state for the next block: the counter plus one, WRAPPING at
+// 2^32.
+//
+// It wraps rather than trapping because the standard's counter is a
+// 32-bit field and there is nowhere in a `@value` return to report an
+// overflow.  The refusal lives one module up, where it can be seen:
+// `cc20aead.apply_into` answers `Cc20CounterOverflow` before it writes
+// anything, so no caller reaches a repeated keystream through this
+// function without having been told. A device driving `block` itself
+// keeps its own count against `CC20_COUNTER_MODULUS`.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let st = chacha20.next_block_state(chacha20.zero_state())
+//     println("${chacha20.counter(st)}")           // 1
+// ```
+pub @tier(embedded)
+fn next_block_state(st: Cc20State) -> Cc20State []
+    todo("chacha20-nv.chacha20.next_block_state")
+
+// State word `i`, 0 ..= 15, or 0 outside that range.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     println("${chacha20.state_word(chacha20.zero_state(), 0)}")   // 1634760805
+// ```
+pub @tier(embedded)
+fn state_word(st: Cc20State, i: Int) -> Int []
+    todo("chacha20-nv.chacha20.state_word")
+
+// ── The rounds ───────────────────────────────────────────────────────
+
+// One quarter round over the four state words named by `a`, `b`, `c`
+// and `d` (RFC 8439 § 2.1).
+//
+// PUBLIC because it is the one function RFC 8439 gives a test vector
+// for on its own (§ 2.1.1), and an implementation that gets the
+// quarter round right gets everything else right by induction.  A
+// caller has no other use for it.
+//
+// Indices outside 0 ..= 15 return the state unchanged.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let st = chacha20.quarter_round(chacha20.zero_state(), 0, 4, 8, 12)
+//     println("${chacha20.state_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn quarter_round(st: Cc20State, a: Int, b: Int, c: Int, d: Int) -> Cc20State []
+    todo("chacha20-nv.chacha20.quarter_round")
+
+// One double round: the four column rounds, then the four diagonal
+// ones (RFC 8439 § 2.3.1).
+//
+// Ten of these are the twenty rounds.  Public so a caller with a
+// half-round trace from another implementation can compare.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let st = chacha20.double_round(chacha20.zero_state())
+//     println("${chacha20.state_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn double_round(st: Cc20State) -> Cc20State []
+    todo("chacha20-nv.chacha20.double_round")
+
+// The block function: ten double rounds over a copy of the state, then
+// the original state added back in word by word (RFC 8439 § 2.3).
+//
+// That final addition is what makes ChaCha20 a cipher rather than a
+// permutation a holder of the output could invert, and it is the one
+// step a port most often drops.
+//
+// THE ENTRY POINT FOR A DEVICE.  Everything it touches is admitted at
+// `@tier(embedded)`, so firmware holding a message in a
+// `static [u8; N]` XORs `block_byte` over it with the heap untouched.
+// The counter does not move: `next_block_state` is a separate call, so
+// a caller that wants block `k` alone pays for one block.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let b = chacha20.block(chacha20.with_counter(chacha20.zero_state(), 1))
+//     println("${chacha20.block_word(b, 0)}")
+// ```
+pub @tier(embedded)
+fn block(st: Cc20State) -> Cc20Block []
+    todo("chacha20-nv.chacha20.block")
+
+// Keystream word `i`, 0 ..= 15, or 0 outside that range.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let b = chacha20.block(chacha20.zero_state())
+//     println("${chacha20.block_word(b, 15)}")
+// ```
+pub @tier(embedded)
+fn block_word(b: Cc20Block, i: Int) -> Int []
+    todo("chacha20-nv.chacha20.block_word")
+
+// Keystream byte `i`, 0 ..= 63, or 0 outside that range.
+//
+// THE IN-PLACE ENCRYPTION PRIMITIVE, and the reason the block is
+// returned rather than written: a device XORs this into a buffer it
+// already owns, one byte at a time, and never holds a second copy of
+// the plaintext.  Word `i / 4` serialised LITTLE-endian, so byte 0 is
+// the low byte of word 0.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let b = chacha20.block(chacha20.zero_state())
+//     println("${chacha20.block_byte(b, 0)}")
+// ```
+pub @tier(embedded)
+fn block_byte(b: Cc20Block, i: Int) -> Int []
+    todo("chacha20-nv.chacha20.block_byte")
+
+// ── HChaCha20 ────────────────────────────────────────────────────────
+
+// The HChaCha20 subkey of a state: twenty rounds, and then words 0..3
+// and 12..15 taken WITHOUT the feed-forward addition.
+//
+// The missing addition is the whole of the construction.  A block
+// feeds the input state back in, which is what stops the output being
+// invertible; HChaCha20 deliberately does not, because its output is
+// going to be used as a key and the input half of it is public nonce.
+// Adding it back would hand an attacker holding the nonce a route to
+// the key words.  An implementation that reuses `block` and then picks
+// eight words out of it is wrong, and this is the note that says so.
+//
+// The caller puts the key in words 4..11 and the FIRST SIXTEEN BYTES of
+// a 24-byte nonce in words 12..15; `cc20x.subkey` is that, spelled for
+// a host with the nonce as bytes.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     println("${chacha20.sub_word(chacha20.hchacha20(chacha20.zero_state()), 0)}")
+// ```
+pub @tier(embedded)
+fn hchacha20(st: Cc20State) -> Cc20Sub []
+    todo("chacha20-nv.chacha20.hchacha20")
+
+// Subkey word `i`, 0 ..= 7, or 0 outside that range.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let s = chacha20.hchacha20(chacha20.zero_state())
+//     println("${chacha20.sub_word(s, 7)}")
+// ```
+pub @tier(embedded)
+fn sub_word(s: Cc20Sub, i: Int) -> Int []
+    todo("chacha20-nv.chacha20.sub_word")
+
+// The state whose key is a subkey: words 4..11 from `s`, the counter
+// and the nonce left zero.
+//
+// The XChaCha20 step a device takes after `hchacha20`, without a
+// `Bytes` between them.
+//
+// ```novo
+// use chacha20
+//
+// fn main() [io]
+//     let s  = chacha20.hchacha20(chacha20.zero_state())
+//     let st = chacha20.state_from_sub(s)
+//     println("${chacha20.counter(st)}")           // 0
+// ```
+pub @tier(embedded)
+fn state_from_sub(s: Cc20Sub) -> Cc20State []
+    todo("chacha20-nv.chacha20.state_from_sub")

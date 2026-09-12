@@ -1,0 +1,50 @@
+[package]
+name        = "chacha20-nv"
+version     = "0.0.1"
+description = "RFC 8439's ChaCha20 and Poly1305: the twenty-round block function as a sixteen-word @value a device holds in its own frame, the one-time MAC fed a block at a time, the AEAD that seals into a caller's buffer and opens with a constant-time tag comparison, and XChaCha20-Poly1305 with the HChaCha20 subkey step for a 24-byte nonce.  The stream cipher for a core with no AES instructions.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  ChaCha20 is addition, XOR and rotation over sixteen 32-bit
+# words, and Poly1305 is arithmetic modulo 2^130 - 5: there is no
+# entropy source here, no clock, and nothing that opens a file.  The
+# key, the nonce and the counter all arrive as arguments, which is what
+# lets the same code run in a hardware wallet's firmware and in a
+# server's request handler.
+#
+# It carries `tests/embedded_probe.nv`, so the device claim is BUILT.
+# `chacha20` and `poly1305` are the two modules the claim covers — the
+# word algebra with no `Bytes` anywhere in it — and the README says
+# which half of the package a device gets.
+layer       = "core"
+
+category    = "crypto"
+
+tags        = ["chacha20", "poly1305", "aead", "xchacha20", "rfc-8439", "stream-cipher", "crypto", "embedded"]
+repository  = "https://github.com/novolang/chacha20-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The stream cipher and one-time MAC for a core with no AES"
+
+[dependencies]
+# crypto-nv, for one function: `digest.ct_eq`, the constant-time byte
+# comparison `cc20aead.open` uses to check a Poly1305 tag.  Taking the
+# dependency rather than writing a second `ct_eq` here is the point —
+# a tag comparison that leaks its answer through timing is the classic
+# AEAD defect, and there should be ONE implementation of that loop in
+# the whole grid for a reviewer to read.
+#
+# `^0.1` resolves to 0.1.1, and crypto-nv is `core`, so `dep-layer`
+# holds.  Nothing else is taken from it: this package hashes nothing.
+crypto-nv = "^0.1"

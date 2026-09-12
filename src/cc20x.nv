@@ -1,0 +1,185 @@
+// cc20x.nv — XChaCha20 and XChaCha20-Poly1305: the same cipher with a
+// 192-bit nonce.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THE LONGER NONCE IS THE POINT.  RFC 8439's nonce is 96 bits, and
+// 96 bits is not enough to pick at random: the birthday bound puts a
+// collision at roughly 2^48 messages, which a busy service reaches.
+// So a 96-bit nonce has to be a COUNTER somebody keeps, and keeping a
+// counter across restarts, across replicas and across a restored
+// backup is exactly the operational problem that produces nonce reuse
+// in the field.
+//
+// XChaCha20 takes 192 bits, which IS safe to pick at random — 2^96
+// messages before the birthday bound, which nothing reaches — and that
+// is the whole reason it exists and the reason paseto-nv's v4.local
+// and age-nv's recipient stanzas use it.  A caller with `[rand]` and
+// no state is the intended one.
+//
+// HOW.  HChaCha20 runs the twenty rounds over the key and the first
+// SIXTEEN bytes of the nonce and takes eight words out without the
+// feed-forward addition (`chacha20.hchacha20` says why the missing
+// addition matters).  Those words are the key for an ordinary
+// ChaCha20 whose 96-bit nonce is four zero bytes followed by the
+// REMAINING EIGHT bytes of the 24-byte nonce.  After that everything
+// is RFC 8439 unchanged, which is why `xseal` and `xopen` are the only
+// two functions here that a caller of `cc20aead` would not recognise.
+//
+// NOT AN RFC.  XChaCha20-Poly1305 is draft-irtf-cfrg-xchacha, which
+// has been a draft for years and is stable, deployed and unchanged —
+// libsodium, age and PASETO v4 all ship it.  The draft's own test
+// vectors are this module's tests, and the README says the same thing
+// where a reader deciding what to depend on will see it.
+
+use std.bytes
+use chacha20
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The XChaCha20 nonce, in bytes: twenty-four.
+pub const XCC20_NONCE_BYTES = 24
+
+// The HChaCha20 subkey, in bytes: thirty-two.
+pub const XCC20_SUBKEY_BYTES = 32
+
+// ── Checking ─────────────────────────────────────────────────────────
+
+// `Some(Cc20NonceLengthWrong)` if `nonce` is not 24 bytes, `None` if
+// it is.
+//
+// Its own function rather than a width argument on
+// `cc20bytes.check_nonce`, so that handing a 12-byte nonce to an
+// XChaCha20 call is refused by name instead of accepted by a check
+// that was told to expect twelve.
+//
+// ```novo
+// use std.bytes
+// use cc20x
+//
+// fn main() [io]
+//     match cc20x.check_xnonce(bytes.zeros(24))
+//         Some(_) => println("refused")
+//         None    => println("24 bytes")
+// ```
+pub fn check_xnonce(nonce: Bytes) -> ?Cc20Error []
+    todo("chacha20-nv.cc20x.check_xnonce")
+
+// ── The subkey ───────────────────────────────────────────────────────
+
+// The HChaCha20 subkey of `key` and the first 16 bytes of `nonce24`,
+// written into `out`.
+//
+// Public because it is useful on its own — it is a key derivation
+// function from a key and a 128-bit label, and libsodium exposes it
+// for exactly that — and because seeing it is how a reader checks that
+// an XChaCha20 implementation did the right thing.
+//
+// `out` must be at least 32 bytes and comes back.
+//
+// ```novo
+// use std.bytes
+// use cc20x
+//
+// fn main() [io]
+//     let k = cc20x.subkey(bytes.zeros(32), bytes.zeros(24), bytes.zeros(32))
+//     println("${bytes.len(k)}")                   // 32
+// ```
+pub fn subkey(key: Bytes, nonce24: Bytes, out: Bytes) -> Bytes []
+    todo("chacha20-nv.cc20x.subkey")
+
+// The ordinary ChaCha20 state an XChaCha20 message runs on: the
+// HChaCha20 subkey as the key, and a 96-bit nonce of four zero bytes
+// followed by bytes 16..23 of `nonce24`.
+//
+// The FOUR ZERO BYTES are the step ports drop.  An implementation that
+// puts the last eight bytes of the long nonce at the START of the
+// 96-bit nonce produces a perfectly self-consistent cipher that no
+// other implementation can read, and the symptom is a tag mismatch
+// against every peer.
+//
+// A short key or nonce is zero-extended, for the reason
+// `cc20bytes.state_from` gives; `check_xnonce` is the refusal.
+//
+// ```novo
+// use std.bytes
+// use chacha20
+// use cc20x
+//
+// fn main() [io]
+//     let st = cc20x.xstate(bytes.zeros(32), bytes.zeros(24), 1)
+//     println("${chacha20.counter(st)}")           // 1
+// ```
+pub fn xstate(key: Bytes, nonce24: Bytes, counter: Int) -> Cc20State []
+    todo("chacha20-nv.cc20x.xstate")
+
+// ── The cipher ───────────────────────────────────────────────────────
+
+// `src` XORed with the XChaCha20 keystream, written at `dst`'s
+// position; the count comes back.
+//
+// The bare cipher, NO AUTHENTICATION — `cc20aead.apply_into`'s warning
+// applies here unchanged.  It is `xstate` followed by
+// `cc20aead.apply_into`, in one call, for a caller that does not want
+// to hold the intermediate state.
+//
+// ```novo
+// use std.bytes
+// use cc20x
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(3))
+//     match cc20x.xapply_into(bytes.zeros(32), bytes.zeros(24), 1, bytes.from_str("abc"), c)
+//         Ok(n)  => println("${n}")                // 3
+//         Err(_) => println("refused")
+// ```
+pub fn xapply_into(key: Bytes, nonce24: Bytes, counter: Int, src: Bytes,
+                   mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20x.xapply_into")
+
+// Seal `plaintext` under `key` and a 24-byte `nonce24` with `aad`
+// authenticated but not encrypted: the ciphertext followed by its
+// 16-byte tag, at `dst`'s position, and the count back.
+//
+// `cc20aead.seal_len` prices it — the framing is identical, only the
+// nonce is longer.  A nonce picked uniformly at random is CORRECT
+// here, which is the difference from `cc20aead.seal` and the reason
+// this construction is the one paseto-nv and age-nv use.
+//
+// ```novo
+// use std.bytes
+// use cc20aead
+// use cc20x
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(cc20aead.seal_len(3)))
+//     match cc20x.xseal(bytes.zeros(32), bytes.zeros(24), bytes.zeros(0), bytes.from_str("abc"), c)
+//         Ok(n)  => println("${n}")                // 19
+//         Err(_) => println("refused")
+// ```
+pub fn xseal(key: Bytes, nonce24: Bytes, aad: Bytes, plaintext: Bytes,
+             mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20x.xseal")
+
+// Open `ciphertext` — the sealed bytes with their trailing tag — under
+// `key` and a 24-byte `nonce24` with `aad`, at `dst`'s position, and
+// the count back.
+//
+// The tag is checked before anything is written, and
+// `Cc20TagMismatch` carries nothing; `cc20aead.open` states the whole
+// of that rule and this function keeps it.
+//
+// ```novo
+// use std.bytes
+// use cc20x
+//
+// fn main() [io]
+//     var c = bytes.cursor_le(bytes.zeros(3))
+//     match cc20x.xopen(bytes.zeros(32), bytes.zeros(24), bytes.zeros(0), bytes.zeros(19), c)
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("not authentic")
+// ```
+pub fn xopen(key: Bytes, nonce24: Bytes, aad: Bytes, ciphertext: Bytes,
+             mut dst: Cursor) -> Result<Int, Cc20Error> []
+    todo("chacha20-nv.cc20x.xopen")

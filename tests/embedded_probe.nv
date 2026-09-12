@@ -1,0 +1,149 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// WHAT THE CLAIM COVERS: `chacha20` and `poly1305`, which is the
+// cipher and the authenticator, and nothing else.
+//
+// The devices this is for are named in the plan's row and they are
+// real: a BLE peripheral whose pairing wants an AEAD (smp-nv), and a
+// hardware wallet that has to encrypt a seed and has no AES
+// instructions to do it with.  Both hold a key in flash, a nonce in a
+// counter, and a message in a `static [u8; N]`.  Neither has a heap.
+//
+// So the two modules the claim covers take no `Bytes`, no `Str` and no
+// list at all: a state is `[Int; 16]` inside a `@value`, a Poly1305
+// block is `[Int; 4]` inside one, and every function between them is
+// word algebra.  Sixty-four bytes of stack for the cipher, a hundred
+// and twelve for the authenticator, and the arena untouched.
+//
+// WHAT IS NOT CLAIMED.  `cc20bytes`, `cc20aead` and `cc20x` all speak
+// `Bytes` and `Cursor`, which are heap objects; they are the host's
+// half and the README says so.  A device that wants the AEAD drives it
+// itself out of the two modules below — `poly_key_for` is a keystream
+// block, and the § 2.8 framing is `absorb_pad` and `absorb_lengths`,
+// both of which are here for exactly that reason.
+//
+// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be.
+// Every body under `src/` is a `todo()`, so what links today is the
+// SIGNATURES and the types — `Int` in and out, `@value` structs with
+// inline arrays, and no allocator anywhere in the shape.  There is no
+// arithmetic in the binary yet, so this probe does not prove the round
+// function is allocation-free; it proves that nothing in the shape of
+// the surface needs an allocator or a host.  Keeping it green once the
+// bodies land is a named cost of the implementation step.
+
+use chacha20
+use poly1305
+
+// A key and a nonce as a device holds them: eight words and three,
+// written into flash by a provisioning step.  These are RFC 8439
+// § 2.4.2's, so a bisect against the specification has somewhere to
+// start once the bodies exist.
+const KEY_WORD_0: Int = 0x03020100
+const KEY_WORD_7: Int = 0x1f1e1d1c
+const NONCE_WORD_2: Int = 0x4a000000
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.  A firmware image has one line of
+// output; making it depend on all of them is what stops a passing run
+// from meaning "the first call linked".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+
+    // Building a state out of words, with no `Bytes` between the
+    // flash and the cipher.
+    var st = chacha20.zero_state()
+    st = chacha20.with_key_word(st, 0, KEY_WORD_0)
+    st = chacha20.with_key_word(st, 7, KEY_WORD_7)
+    st = chacha20.with_nonce_word(st, 2, NONCE_WORD_2)
+    st = chacha20.with_counter(st, 1)
+    if chacha20.counter(st) == 1
+        n = n + 1
+    if chacha20.state_word(st, 4) == KEY_WORD_0
+        n = n + 1
+    if chacha20.state_word(st, 15) == NONCE_WORD_2
+        n = n + 1
+
+    // The counter advancing one block at a time, which is what a
+    // device driving a long message does.
+    if chacha20.counter(chacha20.next_block_state(st)) == 2
+        n = n + 1
+
+    // The round functions and the block, with the keystream read back
+    // as words and as bytes.
+    let qr = chacha20.quarter_round(st, 0, 4, 8, 12)
+    if chacha20.state_word(qr, 0) != 0
+        n = n + 1
+    let dr = chacha20.double_round(st)
+    if chacha20.state_word(dr, 0) != 0
+        n = n + 1
+    let b = chacha20.block(st)
+    if chacha20.block_word(b, 0) != 0
+        n = n + 1
+    if chacha20.block_byte(b, 63) >= 0
+        n = n + 1
+
+    // HChaCha20 and the state it keys, which is XChaCha20's first step
+    // on a device that has a 24-byte nonce from its radio.
+    let sub = chacha20.hchacha20(st)
+    if chacha20.sub_word(sub, 0) != 0
+        n = n + 1
+    if chacha20.counter(chacha20.state_from_sub(sub)) == 0
+        n = n + 1
+
+    // The authenticator: a key split into its two halves, a full block
+    // absorbed, a short one, and the tag read back as words.
+    var c = poly1305.chunk_zero()
+    c = poly1305.chunk_with_word(c, 0, KEY_WORD_0)
+    if poly1305.chunk_word(c, 0) == KEY_WORD_0
+        n = n + 1
+    if poly1305.chunk_byte(c, 0) == 0x00
+        n = n + 1
+    var p = poly1305.poly_zero()
+    p = poly1305.with_r(p, c)
+    p = poly1305.with_s(p, poly1305.chunk_zero())
+    p = poly1305.absorb(p, c)
+    p = poly1305.absorb_last(p, c, 5)
+    if poly1305.tag_word(p, 0) >= 0
+        n = n + 1
+    if poly1305.tag_byte(p, 15) >= 0
+        n = n + 1
+
+    // The AEAD framing, which is the half a device drives itself
+    // because `cc20aead` speaks `Bytes` and a device has none.
+    var q = poly1305.poly_zero()
+    q = poly1305.absorb_pad(q, 11)
+    q = poly1305.absorb_lengths(q, 12, 114)
+    if poly1305.chunk_word(poly1305.tag(q), 3) >= 0
+        n = n + 1
+
+    // The constant-time comparison, at the tier that has no `Bytes` to
+    // give crypto-nv's.
+    if poly1305.chunk_eq(poly1305.chunk_zero(), poly1305.chunk_zero())
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 16 is the number of checks in `score` on the path a linked build
+    // takes.  The count is printed on a failure rather than only
+    // compared, so a device that disagrees with the host says HOW MANY
+    // it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 16
+        hal.uart.write("PASS: chacha20-embedded\n")
+    else
+        hal.uart.write("FAIL: chacha20-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

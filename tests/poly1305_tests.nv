@@ -1,0 +1,167 @@
+// poly1305_tests.nv — the one-time authenticator, against RFC 8439's
+// own vectors.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: chacha20-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// § 2.5.2 IS THE ONE THAT MATTERS.  "Cryptographic Forum Research
+// Group" under the key below is the vector every Poly1305 port is
+// measured against, and it exercises the two things a port gets wrong:
+// the clamp of `r`, and the final conditional subtraction of
+// 2^130 - 5.  § 2.6.2 is the one-time key derivation, which is the
+// step that makes the whole construction safe and the step a caller
+// building something over `poly1305` directly has to do themselves.
+
+use std.bytes
+use std.test
+use poly1305
+use cc20bytes
+use cc20aead
+
+@test
+fn test_the_mac_is_rfc_8439_section_2_5_2() [io]
+    test.case("`Cryptographic Forum Research Group` under § 2.5.2's key")
+    match bytes.from_hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+        Some(k) =>
+            let msg = bytes.from_str("Cryptographic Forum Research Group")
+            test.assert_eq(bytes.len(msg), 34)
+            let tag = cc20bytes.mac_into(k, msg, bytes.zeros(16))
+            test.assert_eq(bytes.len(tag), 16)
+            test.assert_eq_str(bytes.to_hex(tag), "a8061dc1305136c6c22b8baf0c0127a9")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_the_one_time_key_is_rfc_8439_section_2_6_2() [io]
+    test.case("key 80..9f, nonce 00:00:00:00:00:01:02:03:04:05:06:07")
+    match bytes.from_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+        Some(k) =>
+            match bytes.from_hex("000000000001020304050607")
+                Some(n) =>
+                    let pk = cc20aead.poly_key_for(k, n, bytes.zeros(32))
+                    test.assert_eq(bytes.len(pk), 32)
+                    test.assert_eq_str(
+                        bytes.to_hex(pk),
+                        "8ad5a08b905f81cc815040274ab247160ff405cf2dd4c34de40a9d3c2a6e1526")
+                None    => test.fail("the nonce hex is malformed")
+        None    => test.fail("the key hex is malformed")
+
+@test
+fn test_the_one_time_key_is_a_function_of_the_nonce() [io]
+    test.case("a fresh nonce is a fresh Poly1305 key")
+    let a = cc20aead.poly_key_for(bytes.zeros(32), bytes.zeros(12), bytes.zeros(32))
+    match bytes.from_hex("000000000000000000000001")
+        Some(n) =>
+            let b = cc20aead.poly_key_for(bytes.zeros(32), n, bytes.zeros(32))
+            test.assert(bytes.to_hex(a) != bytes.to_hex(b))
+        None    => test.fail("the nonce hex is malformed")
+
+    test.case("a REPEATED nonce is a repeated key — the whole reason a nonce may not repeat")
+    let c = cc20aead.poly_key_for(bytes.zeros(32), bytes.zeros(12), bytes.zeros(32))
+    test.assert_eq_str(bytes.to_hex(a), bytes.to_hex(c))
+
+@test
+fn test_a_chunk_is_four_little_endian_words() [io]
+    test.case("word 0 is bytes 0..3, low byte first")
+    match bytes.from_hex("01020304050607080910111213141516")
+        Some(b) =>
+            let c = cc20bytes.chunk_at(b, 0)
+            test.assert_eq(poly1305.chunk_word(c, 0), 0x04030201)
+            test.assert_eq(poly1305.chunk_byte(c, 0), 0x01)
+            test.assert_eq(poly1305.chunk_byte(c, 3), 0x04)
+        None    => test.fail("the hex is malformed")
+
+    test.case("bytes past the end of the source read as zero")
+    let c = cc20bytes.chunk_at(bytes.zeros(4), 0)
+    test.assert_eq(poly1305.chunk_word(c, 3), 0)
+
+    test.case("an index outside 0..3 answers 0 rather than trapping")
+    test.assert_eq(poly1305.chunk_word(poly1305.chunk_zero(), 4), 0)
+    test.assert_eq(poly1305.chunk_byte(poly1305.chunk_zero(), 16), 0)
+
+@test
+fn test_r_is_clamped_in_the_constructor() [io]
+    test.case("the clamp of § 2.5 happens once, where it cannot be forgotten")
+    // A key whose `r` half is all ones: the clamp clears the top four
+    // bits of bytes 3, 7, 11 and 15 and the bottom two of 4, 8 and 12,
+    // so a state built from it is NOT the state built from the already
+    // clamped bytes being different — it is the same one.
+    match bytes.from_hex("ffffffffffffffffffffffffffffffff00000000000000000000000000000000")
+        Some(raw) =>
+            match bytes.from_hex("ffffff0ffcffff0ffcffff0ffcffff0f00000000000000000000000000000000")
+                Some(clamped) =>
+                    let a = cc20bytes.poly_from(raw)
+                    let b = cc20bytes.poly_from(clamped)
+                    test.assert_eq(poly1305.tag_word(a, 0), poly1305.tag_word(b, 0))
+                    test.assert_eq(poly1305.tag_word(a, 3), poly1305.tag_word(b, 3))
+                None          => test.fail("the clamped hex is malformed")
+        None      => test.fail("the raw hex is malformed")
+
+@test
+fn test_the_last_block_carries_its_own_length() [io]
+    test.case("a short final block and a full one are different messages")
+    let st = cc20bytes.poly_from(bytes.zeros(32))
+    let c = cc20bytes.chunk_at(bytes.zeros(16), 0)
+    let short_ = poly1305.absorb_last(st, c, 3)
+    let full = poly1305.absorb_last(st, c, 16)
+    test.assert(poly1305.tag_word(short_, 0) != poly1305.tag_word(full, 0))
+
+    test.case("a length of zero absorbs nothing")
+    let none_ = poly1305.absorb_last(st, c, 0)
+    test.assert_eq(poly1305.tag_word(none_, 0), poly1305.tag_word(st, 0))
+
+@test
+fn test_the_aead_framing_is_section_2_8_s_and_not_a_guess() [io]
+    test.case("padding to a sixteen-byte boundary is its own step")
+    let st = cc20bytes.poly_from(bytes.zeros(32))
+    test.assert_eq(poly1305.tag_word(poly1305.absorb_pad(st, 0), 0),
+                   poly1305.tag_word(st, 0))
+    test.assert(poly1305.tag_word(poly1305.absorb_pad(st, 11), 0) !=
+                poly1305.tag_word(st, 0))
+
+    test.case("the two lengths are sixty-four bits each, little-endian")
+    // § 2.8.2's own numbers: 12 bytes of additional data, 114 of
+    // ciphertext.  Swapping them is a different final block, which is
+    // what a port that writes them in the other order produces.
+    let a = poly1305.absorb_lengths(st, 12, 114)
+    let b = poly1305.absorb_lengths(st, 114, 12)
+    test.assert(poly1305.tag_word(a, 0) != poly1305.tag_word(b, 0))
+
+@test
+fn test_the_key_s_two_halves_are_set_by_two_calls_because_they_are_used_differently() [io]
+    test.case("`r` is multiplied on every block and `s` is added exactly once")
+    let zero = poly1305.poly_zero()
+    let c = poly1305.chunk_with_word(poly1305.chunk_zero(), 0, 0x0f0f0f0f)
+
+    // Setting `r` changes what absorbing does; setting `s` changes only
+    // the tag.  That asymmetry is why they are two constructors.
+    let with_r_only = poly1305.with_r(zero, c)
+    let with_s_only = poly1305.with_s(zero, c)
+    test.assert(poly1305.tag_word(with_s_only, 0) != poly1305.tag_word(zero, 0))
+    test.assert_eq(poly1305.tag_word(poly1305.absorb(with_s_only, c), 0),
+                   poly1305.tag_word(with_s_only, 0))
+    test.assert(poly1305.tag_word(poly1305.absorb(with_r_only, c), 0) !=
+                poly1305.tag_word(with_r_only, 0))
+
+    test.case("and the tag can be read a byte at a time, which is what a device writes it out with")
+    let full = poly1305.with_s(with_r_only, poly1305.chunk_zero())
+    test.assert_eq(poly1305.tag_byte(full, 0), poly1305.tag_word(full, 0) & 0xff)
+    test.assert_eq(poly1305.tag_byte(full, 3), (poly1305.tag_word(full, 0) >> 24) & 0xff)
+    test.case("an index outside 0..15 answers 0 rather than trapping")
+    test.assert_eq(poly1305.tag_byte(full, 16), 0)
+
+@test
+fn test_a_tag_comparison_does_not_return_early() [io]
+    test.case("two equal tags compare equal")
+    test.assert(poly1305.chunk_eq(poly1305.chunk_zero(), poly1305.chunk_zero()))
+
+    test.case("a difference in the LAST word is found as surely as one in the first")
+    let a = poly1305.chunk_with_word(poly1305.chunk_zero(), 3, 1)
+    let b = poly1305.chunk_with_word(poly1305.chunk_zero(), 0, 1)
+    test.assert(poly1305.chunk_eq(a, poly1305.chunk_zero()) == false)
+    test.assert(poly1305.chunk_eq(b, poly1305.chunk_zero()) == false)
+
+    test.case("the `Bytes` form is crypto-nv's `digest.ct_eq` and answers the same")
+    test.assert(cc20aead.tag_matches(bytes.zeros(16), bytes.zeros(16)))
+    test.case("buffers of different lengths are not equal, and that is not a leak")
+    test.assert(cc20aead.tag_matches(bytes.zeros(16), bytes.zeros(15)) == false)

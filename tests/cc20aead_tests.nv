@@ -1,0 +1,140 @@
+// cc20aead_tests.nv — the AEAD, against RFC 8439 § 2.8.2, and the two
+// refusals that are the package's security surface.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: chacha20-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+
+use std.bytes
+use std.test
+use cc20aead
+use cc20bytes
+use cc20err
+
+// § 2.8.2's inputs, written once.
+fn vector_key() -> Bytes
+    bytes.from_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f") ?? bytes.zeros(32)
+
+fn vector_nonce() -> Bytes
+    bytes.from_hex("070000004041424344454647") ?? bytes.zeros(12)
+
+fn vector_aad() -> Bytes
+    bytes.from_hex("50515253c0c1c2c3c4c5c6c7") ?? bytes.zeros(12)
+
+fn vector_plaintext() -> Bytes
+    bytes.from_str("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+
+@test
+fn test_seal_is_rfc_8439_section_2_8_2() [io]
+    test.case("114 bytes of plaintext, 12 of additional data")
+    let pt = vector_plaintext()
+    test.assert_eq(bytes.len(pt), 114)
+    test.assert_eq(cc20aead.seal_len(114), 130)
+
+    var c = bytes.cursor_le(bytes.zeros(130))
+    match cc20aead.seal(vector_key(), vector_nonce(), vector_aad(), pt, c)
+        Ok(n)  =>
+            test.assert_eq(n, 130)
+            let out = c.finish()
+            test.case("the ciphertext's first eight bytes, § 2.8.2")
+            test.assert_eq_str(bytes.to_hex(bytes.slice(out, 0, 8)), "d31a8d34648e60db")
+            test.case("the tag is the LAST sixteen bytes, § 2.8.2")
+            test.assert_eq_str(bytes.to_hex(bytes.slice(out, 114, 130)),
+                               "1ae10b594f09e26a7e902ecbd0600691")
+        Err(_) => test.fail("a correctly sized buffer was refused")
+
+@test
+fn test_open_undoes_seal() [io]
+    test.case("round trip")
+    var c = bytes.cursor_le(bytes.zeros(cc20aead.seal_len(3)))
+    let pt = bytes.from_str("abc")
+    match cc20aead.seal(vector_key(), vector_nonce(), vector_aad(), pt, c)
+        Ok(n)  =>
+            test.assert_eq(n, 19)
+            var d = bytes.cursor_le(bytes.zeros(3))
+            match cc20aead.open(vector_key(), vector_nonce(), vector_aad(), c.finish(), d)
+                Ok(m)  =>
+                    test.assert_eq(m, 3)
+                    test.assert_eq_str(bytes.to_hex(d.finish()), bytes.to_hex(pt))
+                Err(_) => test.fail("what seal wrote, open refused")
+        Err(_) => test.fail("a correctly sized buffer was refused")
+
+@test
+fn test_a_flipped_bit_anywhere_is_refused() [io]
+    test.case("a changed ciphertext byte is not authentic")
+    var c = bytes.cursor_le(bytes.zeros(cc20aead.seal_len(3)))
+    match cc20aead.seal(vector_key(), vector_nonce(), vector_aad(), bytes.from_str("abc"), c)
+        Ok(_)  =>
+            let sealed = c.finish()
+            let bad = bytes.set_u8(bytes.copy_into(bytes.zeros(19), 0, sealed, 0, 19), 0, 0xff)
+            var d = bytes.cursor_le(bytes.zeros(3))
+            match cc20aead.open(vector_key(), vector_nonce(), vector_aad(), bad, d)
+                Ok(_)  => test.fail("a changed ciphertext opened")
+                Err(e) =>
+                    match e
+                        Cc20TagMismatch => test.assert(true)
+                        _               => test.fail("a changed ciphertext should be a tag mismatch")
+        Err(_) => test.fail("a correctly sized buffer was refused")
+
+    test.case("changed ADDITIONAL DATA is not authentic either — that is what `aad` is for")
+    var e = bytes.cursor_le(bytes.zeros(cc20aead.seal_len(3)))
+    match cc20aead.seal(vector_key(), vector_nonce(), vector_aad(), bytes.from_str("abc"), e)
+        Ok(_)  =>
+            var f = bytes.cursor_le(bytes.zeros(3))
+            match cc20aead.open(vector_key(), vector_nonce(), bytes.zeros(12), e.finish(), f)
+                Ok(_)  => test.fail("a changed aad opened")
+                Err(_) => test.assert(true)
+        Err(_) => test.fail("a correctly sized buffer was refused")
+
+@test
+fn test_a_failed_open_says_nothing_and_writes_nothing() [io]
+    test.case("`Cc20TagMismatch` carries no position, no count and no partial plaintext")
+    var d = bytes.cursor_le(bytes.zeros(3))
+    match cc20aead.open(vector_key(), vector_nonce(), vector_aad(), bytes.zeros(19), d)
+        Ok(_)  => test.fail("nineteen zero bytes are not a valid sealed message")
+        Err(_) =>
+            // The buffer is exactly as it was handed in.
+            test.assert_eq_str(bytes.to_hex(d.finish()), "000000")
+            test.assert_eq(d.pos(), 0)
+
+@test
+fn test_a_short_ciphertext_is_refused_as_short_and_not_as_a_forgery() [io]
+    test.case("fewer than sixteen bytes is not even a tag")
+    match cc20aead.open_len(15)
+        Ok(_)  => test.fail("fifteen bytes cannot carry a tag")
+        Err(e) =>
+            match e
+                Cc20CiphertextTooShort(got, want) =>
+                    test.assert_eq(got, 15)
+                    test.assert_eq(want, 16)
+                _                                 => test.fail("the refusal should name both numbers")
+
+    test.case("sixteen bytes is an empty message with its tag")
+    match cc20aead.open_len(16)
+        Ok(n)  => test.assert_eq(n, 0)
+        Err(_) => test.fail("sixteen bytes is a valid empty sealed message")
+
+    test.case("the two length functions agree both ways")
+    match cc20aead.open_len(cc20aead.seal_len(114))
+        Ok(n)  => test.assert_eq(n, 114)
+        Err(_) => test.fail("seal_len's answer should be openable")
+
+@test
+fn test_the_two_kinds_of_error_are_told_apart() [io]
+    test.case("a tag mismatch is a security event")
+    test.assert(cc20err.is_authentication_failure(Cc20TagMismatch))
+    test.case("a wrong key width is a bug in the program")
+    test.assert(cc20err.is_authentication_failure(Cc20KeyLengthWrong(16, 32)) == false)
+    test.assert(cc20err.is_authentication_failure(Cc20OutputTooSmall(3, 2)) == false)
+
+@test
+fn test_the_message_ceiling_is_refused_rather_than_wrapped() [io]
+    test.case("2^38 - 64 is the most one key and nonce may cover")
+    test.assert_eq(cc20aead.CC20P_MAX_MESSAGE_BYTES, 274877906880)
+    test.case("`advance` past the ceiling is a caller who ignored a refusal")
+    // `apply_into` refuses before it writes, so `advance` never has to.
+    var c = bytes.cursor_le(bytes.zeros(1))
+    match cc20aead.apply_into(cc20bytes.state_from(bytes.zeros(32), bytes.zeros(12), 4294967295),
+                              bytes.from_str("ab"), c)
+        Ok(_)  => test.fail("a message past the counter's ceiling was accepted")
+        Err(_) => test.assert(true)

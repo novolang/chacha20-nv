@@ -1,0 +1,371 @@
+// poly1305.nv — the one-time authenticator of RFC 8439 § 2.5, as a
+// `@value` state fed a sixteen-byte block at a time.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE OTHER HALF THAT RUNS ON A DEVICE.  No `Bytes`, no `Str`, no
+// list: the state is fourteen inline words and every function over it
+// is `@tier(embedded)`.  `cc20bytes` is the bridge for a host that has
+// its message as bytes.
+//
+// ONE-TIME MEANS ONE-TIME.  A Poly1305 key authenticates exactly ONE
+// message.  Two tags under the same key give an attacker two equations
+// in the two unknowns `r` and `s` over a field, and `r` falls out — so
+// they can then forge a tag for any message they like.  That is why
+// RFC 8439 § 2.6 derives a fresh Poly1305 key from the ChaCha20
+// keystream at counter zero for every AEAD message, and why this
+// module's key constructors take the key that derivation produced
+// rather than a long-lived one.  `cc20aead.seal` does the derivation;
+// a caller reaching for `poly1305` directly is taking that discipline
+// on themselves, and this is where they are told so.
+//
+// WHY FIVE LIMBS.  The arithmetic is modulo 2^130 - 5, which does not
+// fit an `Int`.  The standard implementation carries the accumulator
+// as five 26-bit limbs, so a limb times a limb is 52 bits and a sum of
+// five such products stays under 2^55 — inside `Int`'s 64 bits with
+// room for the carries, and never trapping (SPEC § 13.2).  The layout
+// is public in the struct's fields because a caller comparing against
+// another port needs to see it.
+//
+// WHAT IS CONSTANT TIME HERE:
+//
+//   * `absorb` and `absorb_last` are constant time — multiply, add and
+//     carry, no branch on message or key content.  `absorb_last` takes
+//     the length as an argument and the length of a message is not a
+//     secret in any construction this package supports.
+//   * `tag_word` and `tag_byte` are the final reduction and the
+//     addition of `s`; a correct implementation does the conditional
+//     subtraction of 2^130 - 5 with a mask rather than an `if`, and
+//     that is a requirement on the body rather than something a
+//     signature can carry. It is stated here so the implementation
+//     lane cannot miss it.
+//   * COMPARING a tag is NOT in this module.  `cc20aead.tag_matches`
+//     is crypto-nv's `digest.ct_eq`, and it is the only comparison in
+//     the package.
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The Poly1305 key, in bytes: thirty-two — sixteen of `r` and sixteen
+// of `s`.
+pub const POLY1305_KEY_BYTES = 32
+
+// The tag, in bytes: sixteen.
+pub const POLY1305_TAG_BYTES = 16
+
+// The block, in bytes: sixteen.
+pub const POLY1305_BLOCK_BYTES = 16
+
+// ── The two values ───────────────────────────────────────────────────
+
+// Sixteen bytes read as four little-endian 32-bit words: one Poly1305
+// block, one half of a Poly1305 key, or one AEAD tag.
+//
+// A `@value` of four words rather than a `Bytes`, so the device path
+// never holds a heap object.  `cc20bytes.chunk_at` makes one from a
+// host's buffer; `chunk_with_word` makes one from four words a device
+// read out of a peripheral.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let c = poly1305.chunk_with_word(poly1305.chunk_zero(), 0, 1)
+//     println("${poly1305.chunk_word(c, 0)}")      // 1
+// ```
+pub @value
+struct Cc20Chunk
+    // Four 32-bit words, little-endian: word `i` is bytes
+    // `4*i .. 4*i+3`.
+    w: [Int; 4]
+
+// A Poly1305 authenticator in flight.
+//
+// A `@value` struct, so it is fourteen words in the caller's frame
+// with no cell and no reference count.  It carries no partial block —
+// that is what keeps it fourteen words and nothing else — so a caller
+// streaming a long message feeds `absorb` whole sixteen-byte blocks
+// and gives the remainder to `absorb_last`.  `cc20bytes.mac_into` is
+// that loop written once for a host.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.tag_word(poly1305.poly_zero(), 0)}")
+// ```
+pub @value
+struct Cc20Poly
+    // `r`, clamped, as five 26-bit limbs (RFC 8439 § 2.5's
+    // `clamp(r)`).
+    r: [Int; 5]
+    // The accumulator, as five 26-bit limbs.
+    h: [Int; 5]
+    // `s`, the second half of the key, as four 32-bit words — added
+    // once at the end and never multiplied, so it needs no limb
+    // layout.
+    s: [Int; 4]
+
+// ── Building a chunk ─────────────────────────────────────────────────
+
+// Four zero words.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.chunk_word(poly1305.chunk_zero(), 3)}")   // 0
+// ```
+pub @tier(embedded)
+fn chunk_zero() -> Cc20Chunk []
+    todo("chacha20-nv.poly1305.chunk_zero")
+
+// The chunk with word `i` — 0 ..= 3 — replaced, masked to 32 bits.
+//
+// `i` outside the range returns the chunk unchanged: a `@value`
+// function has nowhere to put a refusal.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let c = poly1305.chunk_with_word(poly1305.chunk_zero(), 2, 5)
+//     println("${poly1305.chunk_word(c, 2)}")      // 5
+// ```
+pub @tier(embedded)
+fn chunk_with_word(c: Cc20Chunk, i: Int, w: Int) -> Cc20Chunk []
+    todo("chacha20-nv.poly1305.chunk_with_word")
+
+// Word `i` of a chunk, 0 ..= 3, or 0 outside that range.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.chunk_word(poly1305.chunk_zero(), 0)}")   // 0
+// ```
+pub @tier(embedded)
+fn chunk_word(c: Cc20Chunk, i: Int) -> Int []
+    todo("chacha20-nv.poly1305.chunk_word")
+
+// Byte `i` of a chunk, 0 ..= 15, or 0 outside that range — word
+// `i / 4` serialised little-endian.
+//
+// What a device writes a finished tag out with, one byte at a time,
+// with no `Bytes` in the picture.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.chunk_byte(poly1305.chunk_zero(), 0)}")   // 0
+// ```
+pub @tier(embedded)
+fn chunk_byte(c: Cc20Chunk, i: Int) -> Int []
+    todo("chacha20-nv.poly1305.chunk_byte")
+
+// ── Building the state ───────────────────────────────────────────────
+
+// A state with `r`, `s` and the accumulator all zero.
+//
+// Not usable as it stands: `with_r` and `with_s` are what put the key
+// in, and the split is deliberate — the two halves of a Poly1305 key
+// are used completely differently, `r` multiplied on every block and
+// `s` added exactly once, and a caller reading this surface should see
+// that before they read a body.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.tag_word(poly1305.poly_zero(), 3)}")
+// ```
+pub @tier(embedded)
+fn poly_zero() -> Cc20Poly []
+    todo("chacha20-nv.poly1305.poly_zero")
+
+// The state with `r` set from the key's first sixteen bytes, CLAMPED.
+//
+// RFC 8439 § 2.5's `clamp` clears the top four bits of bytes 3, 7, 11
+// and 15 and the bottom two bits of bytes 4, 8 and 12.  It happens
+// HERE, in the constructor, so a value of this type always holds a
+// usable `r` — the same rule x25519-nv states for its scalar, and for
+// the same reason: a caller cannot forget a step that has no place to
+// be forgotten.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let st = poly1305.with_r(poly1305.poly_zero(), poly1305.chunk_zero())
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn with_r(st: Cc20Poly, r: Cc20Chunk) -> Cc20Poly []
+    todo("chacha20-nv.poly1305.with_r")
+
+// The state with `s` set from the key's second sixteen bytes, as
+// written — `s` is not clamped and not reduced.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let st = poly1305.with_s(poly1305.poly_zero(), poly1305.chunk_zero())
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn with_s(st: Cc20Poly, s: Cc20Chunk) -> Cc20Poly []
+    todo("chacha20-nv.poly1305.with_s")
+
+// ── Absorbing ────────────────────────────────────────────────────────
+
+// Absorb one WHOLE sixteen-byte block: append the 0x01 byte the
+// standard adds at position 16, add, multiply by `r`, reduce.
+//
+// A caller streaming a long message calls this for every full block
+// and `absorb_last` once at the end — including for a message whose
+// length is a multiple of sixteen, where the last block is full and
+// `absorb_last(st, c, 16)` is the call, because the final reduction
+// belongs with it.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let st = poly1305.absorb(poly1305.poly_zero(), poly1305.chunk_zero())
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn absorb(st: Cc20Poly, block: Cc20Chunk) -> Cc20Poly []
+    todo("chacha20-nv.poly1305.absorb")
+
+// Absorb the last block, `n` bytes of it, 1 ..= 16.
+//
+// The 0x01 byte goes at position `n` rather than at 16, which is the
+// one thing that distinguishes a short final block from a full one.
+// `n` of 0 returns the state unchanged — a message whose length is a
+// multiple of sixteen ends with a FULL block passed as `n = 16`, and
+// an empty message is authenticated by absorbing nothing, so neither
+// case wants a zero-length block absorbed.
+//
+// The bytes of `block` at and above `n` are IGNORED rather than
+// required to be zero, because a host reading a chunk out of a larger
+// buffer would otherwise have to clear them.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let st = poly1305.absorb_last(poly1305.poly_zero(), poly1305.chunk_zero(), 3)
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn absorb_last(st: Cc20Poly, block: Cc20Chunk, n: Int) -> Cc20Poly []
+    todo("chacha20-nv.poly1305.absorb_last")
+
+// Absorb sixteen zero bytes, `n` of them — the AEAD construction's
+// padding to a multiple of sixteen (RFC 8439 § 2.8).
+//
+// Public because the padding is where AEAD ports go wrong: the
+// additional data and the ciphertext are each padded to a sixteen-byte
+// boundary before the two lengths go in, and an implementation that
+// pads one and not the other authenticates a different message than
+// its peer does — which shows up as a tag mismatch nobody can locate.
+// `cc20aead.mac_aead` writes the whole sequence once.
+//
+// `n` of 0 or less returns the state unchanged.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let st = poly1305.absorb_pad(poly1305.poly_zero(), 5)
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn absorb_pad(st: Cc20Poly, n: Int) -> Cc20Poly []
+    todo("chacha20-nv.poly1305.absorb_pad")
+
+// Absorb the AEAD's two lengths: the additional data's and the
+// ciphertext's, each as a little-endian 64-bit number, as one final
+// sixteen-byte block (RFC 8439 § 2.8).
+//
+// Its own function rather than a chunk a caller assembles, because the
+// widths are the part people get wrong: both are SIXTY-FOUR bits, not
+// thirty-two, and both are little-endian even though nothing else in
+// the packet is.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let st = poly1305.absorb_lengths(poly1305.poly_zero(), 12, 114)
+//     println("${poly1305.tag_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn absorb_lengths(st: Cc20Poly, aad_len: Int, text_len: Int) -> Cc20Poly []
+    todo("chacha20-nv.poly1305.absorb_lengths")
+
+// ── Finishing ────────────────────────────────────────────────────────
+
+// The finished tag: the accumulator reduced modulo 2^130 - 5, then `s`
+// added modulo 2^128, as a four-word chunk.
+//
+// The state is NOT changed and this may be called more than once,
+// which is what lets a device read the tag out word by word without
+// keeping a second copy.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     let t = poly1305.tag(poly1305.poly_zero())
+//     println("${poly1305.chunk_word(t, 0)}")
+// ```
+pub @tier(embedded)
+fn tag(st: Cc20Poly) -> Cc20Chunk []
+    todo("chacha20-nv.poly1305.tag")
+
+// Word `i` of the finished tag, 0 ..= 3, or 0 outside that range.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.tag_word(poly1305.poly_zero(), 0)}")
+// ```
+pub @tier(embedded)
+fn tag_word(st: Cc20Poly, i: Int) -> Int []
+    todo("chacha20-nv.poly1305.tag_word")
+
+// Byte `i` of the finished tag, 0 ..= 15, or 0 outside that range.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.tag_byte(poly1305.poly_zero(), 0)}")
+// ```
+pub @tier(embedded)
+fn tag_byte(st: Cc20Poly, i: Int) -> Int []
+    todo("chacha20-nv.poly1305.tag_byte")
+
+// Whether two tags are equal, in time that does not depend on WHERE
+// they differ.
+//
+// The device-tier comparison, for firmware that has no `Bytes` to give
+// `cc20aead.tag_matches`.  It is four word comparisons folded into one
+// answer with OR rather than short-circuited with `&&` — an `&&` chain
+// returns early on the first differing word and tells an attacker how
+// many words they have guessed, which is the standard forgery oracle.
+//
+// ```novo
+// use poly1305
+//
+// fn main() [io]
+//     println("${poly1305.chunk_eq(poly1305.chunk_zero(), poly1305.chunk_zero())}")   // true
+// ```
+pub @tier(embedded)
+fn chunk_eq(a: Cc20Chunk, b: Cc20Chunk) -> Bool []
+    todo("chacha20-nv.poly1305.chunk_eq")
